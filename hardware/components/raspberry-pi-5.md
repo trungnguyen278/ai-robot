@@ -1,6 +1,6 @@
 # Raspberry Pi 5 (8 GB)
 
-> Last updated: 2026-10-27. Several entries rely on a copy of the product brief and on secondary sources (marked as such); re-check them against the official documentation.
+> Last updated: 2026-11-02. Several entries rely on a copy of the product brief and on secondary sources (marked as such); re-check them against the official documentation.
 
 - **Role in the robot:** the brain — audio, vision, face, networking, AI.
 - **Exact model / variant:** Raspberry Pi 5, 8 GB RAM.
@@ -28,7 +28,7 @@
 | Function | GPIO (physical pin) | Notes |
 |---|---|---|
 | I2C1 | 2 SDA (3), 3 SCL (5) | Enable with `dtparam=i2c_arm=on` |
-| UART0 | 14 TX (8), 15 RX (10) | Full PL011 UART; the console lives on the separate debug connector. Enabled with the `uart0-pi5` overlay, present in Raspberry Pi OS's and Ubuntu 26.04's kernels (checked 2026-10-28) |
+| UART0 | 14 TX (8), 15 RX (10) | Full PL011 UART. Raspberry Pi OS keeps its console on the 3-pin debug connector (UART10, `ttyAMA10`), but **Ubuntu 26.04's image puts its kernel console and a serial login on UART0** (`console=ttyAMA0,115200`, `serial-getty@ttyAMA0`; checked 2026-11-02): move them before wiring these pins. Enabled with the `uart0-pi5` overlay, present in Raspberry Pi OS's and Ubuntu 26.04's kernels (checked 2026-10-28) |
 | I2S / PCM | 18 BCLK (12), 19 LRCLK (35), 20 DIN (38), 21 DOUT (40) | **The only I2S pin group on the header**; enable with `dtparam=i2s=on` or the HAT's overlay |
 | Hardware PWM | 12, 13, 18, 19 | 18/19 overlap with I2S |
 | SPI0 | 7–11 | Enable with `dtparam=spi=on` |
@@ -70,6 +70,11 @@ Measured on 2026-10-28, under Raspberry Pi OS:
   - so it assumed 3 A (`max_current` 3000 mA) and holds its USB ports to about 600 mA (`usb_max_current_enable=0`), too little for the XVF3800 array at volume ([hardware open issue 10](../README.md));
   - the official supply should offer 5.1 V at 5 A. To check: a power cycle, and the plug and cable between the two.
 
+Checked on 2026-11-02, under Ubuntu 26.04.1 (kernel 7.0.0-1020-raspi):
+- **Serial ports:** `ttyAMA0` is RP1's first UART (`serial@30000`, GPIO 14/15) and carries Ubuntu's console; `ttyAMA10` is the BCM2712's UART on the 3-pin debug connector (`serial@7d001000`), without a login.
+- **Wi-Fi:** the CYW43455 runs firmware 7.45.265 (`brcm/brcmfmac43455-sdio`). Ubuntu loads brcmfmac with `roamoff=0` and no feature mask, whereas Raspberry Pi OS ships `roamoff=1 feature_disable=0x282000` "for stability" ([dev log](../../docs/devlog/2026-11.md)). The firmware rejects the VN country code.
+- **GPU in snaps:** the Chromium snap cannot use the GPU, because snapd's `opengl` interface does not cover the Pi 5's PCIe path ([dev log](../../docs/devlog/2026-11.md)).
+
 ## AI performance (estimates, see ADR-0001)
 
 - Theoretical memory bandwidth is ~17 GB/s (LPDDR4X-4267 on a 32-bit bus), so local LLMs run at roughly 1.5–2 tokens/s for 7–8B models, 4–6 tokens/s for 3B and 8–12 tokens/s for 1.5B. Community figures, not measured here.
@@ -100,3 +105,6 @@ Measured on 2026-10-28, under Raspberry Pi OS:
 - [Pi 5 boards need an EEPROM update to boot kernel 7.0](https://lists.snapcraft.io/archives/foundations-bugs/2026-March/547030.html), Launchpad bug 2146383, March 2026
 - [Changing to a 4K page size on the Raspberry Pi](https://pimylifeup.com/raspberry-pi-page-size/) — PiMyLifeUp (secondary), retrieved 2026-10-28
 - Ubuntu 26.04's Raspberry Pi kernel, at tag `Ubuntu-raspi-7.0.0-1022.22`: [its configuration](https://git.launchpad.net/~ubuntu-kernel/ubuntu/+source/linux-raspi/+git/resolute/plain/debian.master/config/annotations?h=Ubuntu-raspi-7.0.0-1022.22) (16 KB pages off on arm64) and [its overlays](https://git.launchpad.net/~ubuntu-kernel/ubuntu/+source/linux-raspi/+git/resolute/plain/arch/arm/boot/dts/overlays/Makefile?h=Ubuntu-raspi-7.0.0-1022.22), retrieved 2026-10-28
+- [Raspberry Pi configuration — UARTs](https://www.raspberrypi.com/documentation/computers/configuration.html) (the Pi 5's debug connector is UART10, `ttyAMA10`), retrieved 2026-11-02
+- [Raspberry Pi OS's brcmfmac options](https://github.com/RPi-Distro/firmware-nonfree/commit/348a96721f) (`debian/rpi-brcmfmac.conf`, 2026-07-10) and the [feature bits](https://github.com/raspberrypi/linux/blob/rpi-6.18.y/drivers/net/wireless/broadcom/brcm80211/brcmfmac/feature.h) they disable, retrieved 2026-11-02
+- [snapd's `opengl` interface](https://github.com/canonical/snapd/blob/master/interfaces/builtin/opengl.go) (PCI paths for `platform/{soc,scb}` only), retrieved 2026-11-02

@@ -36,7 +36,10 @@ description: Raspberry Pi 5 (8 GB) platform knowledge and checklists for this ro
 - The robot runs Ubuntu 26.04 rather than Raspberry Pi OS (ADR-0017). Raspberry Pi's guides assume Raspberry Pi OS, so check each step on Ubuntu:
   - `config.txt` lives in `/boot/firmware/`, as on Raspberry Pi OS. Check that each overlay the robot needs (TPM, display) ships with Ubuntu's kernel;
   - the bootloader EEPROM must be dated 2025-02-11 or later;
-  - Picamera2 and the IMX500's firmware are not in Ubuntu's archive (`hardware/components/raspberry-pi-ai-camera.md`).
+  - Picamera2 and the IMX500's firmware are not in Ubuntu's archive (`hardware/components/raspberry-pi-ai-camera.md`);
+  - Ubuntu's image puts the serial console on UART0 (GPIO 14/15, `ttyAMA0`), not on the debug connector: move it before wiring UART0;
+  - Ubuntu loads the Wi-Fi driver without the options Raspberry Pi OS ships for stability (`options brcmfmac roamoff=1 feature_disable=0x282000`): add them in `/etc/modprobe.d/`;
+  - the Chromium snap cannot use the Pi 5's GPU: snapd's `opengl` interface does not cover its PCIe path (`docs/devlog/2026-11.md`).
 
 ## When the reference is missing something
 
