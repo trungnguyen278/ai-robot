@@ -15,6 +15,7 @@ from ai_robot.core.config import platform_dir
 from ai_robot.core.data import Schema
 from ai_robot.core.jose import b64url, b64url_decode
 from ai_robot.core.setup_session import (
+    MAX_ERROR,
     MAX_MESSAGE,
     AppSession,
     Ended,
@@ -168,6 +169,14 @@ def test_messages_in_the_clear_are_refused_once_encrypted(secret: Secret) -> Non
 def test_a_message_too_long_ends_the_session(secret: Secret) -> None:
     with pytest.raises(Refusal, match="too long"):
         robot(secret).receive(b" " * (MAX_MESSAGE + 1))
+
+
+def test_an_error_s_text_fits_the_protocol(secret: Secret) -> None:
+    error = json.loads(robot(secret).error(Refusal("protocol", "x" * (MAX_ERROR + 50))))
+    assert len(error["message"]) == MAX_ERROR
+    root = json.loads((platform_dir() / "setup" / "schema.json").read_text(encoding="utf-8"))
+    device = Schema("setup", {**root, "$ref": "#/$defs/from_device"})
+    assert device.problem(error) is None
 
 
 def test_the_code_stays_out_of_logs(secret: Secret) -> None:

@@ -9,12 +9,13 @@ made, so that a bad value fails at its publisher rather than inside another modu
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+import re
+from collections.abc import Iterator, Mapping
 from types import MappingProxyType
 from typing import Any
 
 from jsonschema import Draft202012Validator, validators
-from jsonschema.exceptions import SchemaError, best_match
+from jsonschema.exceptions import SchemaError, ValidationError, best_match
 
 
 def frozen(name: str, data: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -60,9 +61,31 @@ def _freeze(value: Any) -> Any:
     return value
 
 
-# Read-only mappings and tuples pass as JSON objects and arrays.
+def ecma_end(pattern: str) -> str:
+    r"""``pattern`` for Python's ``re``, whose ``$`` also matches before a last newline:
+    JSON Schema's patterns are ECMA-262's, whose ``$`` matches at the very end only, as
+    Python's ``\Z`` does. Only a ``$`` that ends the pattern, unescaped, is an anchor here;
+    the protocols' patterns have no other (tests/test_data.py)."""
+    body = pattern.removesuffix("$")
+    if body == pattern:
+        return pattern
+    backslashes = len(body) - len(body.rstrip("\\"))
+    return pattern if backslashes % 2 else body + r"\Z"
+
+
+def _pattern(
+    validator: Any, pattern: str, instance: Any, _schema: Mapping[str, Any]
+) -> Iterator[ValidationError]:
+    """JSON Schema's ``pattern``, with its end read as ECMA-262 reads it."""
+    if validator.is_type(instance, "string") and not re.search(ecma_end(pattern), instance):
+        yield ValidationError("does not match the pattern")
+
+
+# Read-only mappings and tuples pass as JSON objects and arrays, and patterns end where
+# ECMA-262's end.
 _Validator = validators.extend(
     Draft202012Validator,
+    {"pattern": _pattern},
     type_checker=Draft202012Validator.TYPE_CHECKER.redefine_many(
         {
             "object": lambda _, value: isinstance(value, Mapping),
@@ -85,9 +108,25 @@ class Schema:
         self._validator = _Validator(self.schema)
 
     def problem(self, instance: Any) -> str | None:
-        """What is wrong with ``instance``, or ``None`` if it matches."""
+        """What is wrong with ``instance``, or ``None`` if it matches: where, and the rule
+        it breaks, never the value, which may be a password or a token."""
         error = best_match(self._validator.iter_errors(instance))
-        if error is None:
-            return None
-        where = ".".join(str(part) for part in error.absolute_path)
-        return f"{where}: {error.message}" if where else error.message
+        return None if error is None else _describe(error)
+
+
+def _describe(error: ValidationError) -> str:
+    """Where ``error`` is and which rule it breaks: jsonschema's own messages quote the
+    value, and problems are logged and sent."""
+    where = ".".join(str(part) for part in error.absolute_path)
+    match error.validator:
+        case "required":
+            # It quotes the missing property's name, which the schema defines.
+            rule = error.message
+        case "type":
+            rule = f"must be of type {error.validator_value}"
+        case None:
+            # A subschema that is false.
+            rule = "is not allowed"
+        case _:
+            rule = f"breaks {error.validator} {json.dumps(error.validator_value)}"
+    return f"{where}: {rule}" if where else rule
