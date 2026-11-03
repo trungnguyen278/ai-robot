@@ -37,6 +37,7 @@ NONCE_ZEROS = bytes(4)  # a nonce is these, then the sender's counter
 COUNTER_BYTES = 8
 TAG_BYTES = 16  # AES-GCM's tag
 MAX_MESSAGE = 8192  # bytes in a message, as sent
+MAX_ERROR = 256  # characters in an error's message (schema.json, $defs/error)
 SALT_BYTES = 16
 CODE_DIGITS = 8
 DISCRIMINATOR_DIGITS = 4  # hexadecimal
@@ -198,10 +199,10 @@ class Session:
         return message
 
     def error(self, refusal: Refusal, reply_to: int | None = None) -> bytes:
-        """The error message for ``refusal``, ready to send."""
-        return self.pack(
-            self.message("error", reply_to, code=refusal.code, message=refusal.message)
-        )
+        """The error message for ``refusal``, ready to send, its text cut to what the
+        protocol allows."""
+        text = refusal.message[:MAX_ERROR]
+        return self.pack(self.message("error", reply_to, code=refusal.code, message=text))
 
     def pack(self, message: Mapping[str, Any]) -> bytes:
         """``message`` as sent: JSON, encrypted once the exchange is done."""

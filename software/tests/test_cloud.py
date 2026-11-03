@@ -226,7 +226,7 @@ def test_arguments_are_checked_before_the_owner_sees_them() -> None:
             await until(lambda: cloud.online)
             data, error = await cloud.call("lamp.set", {"on": "yes"})
             assert data is None
-            assert error == "invalid arguments: on: 'yes' is not of type 'boolean'"
+            assert error == "invalid arguments: on: must be of type boolean"
             assert (await cloud.call("lamp.set", {"on": True, "colour": "red"}))[1] is not None
             assert lamp.calls == [] and calls.pending == 0
 
@@ -574,7 +574,8 @@ def test_scene_data_the_renderer_cannot_draw_is_refused() -> None:
             sunny = {"scene": "weather", "data": {"condition": "sunny"}}
             data, error = await cloud.call("screen.show_scene", sunny)
             assert data is None and error is not None
-            assert error.startswith("invalid arguments: data.condition: 'sunny' is not one of")
+            assert error.startswith("invalid arguments: data.condition: breaks enum [")
+            assert "sunny" not in error
             long = {"scene": "timer", "data": {"label": "x" * 17}}
             assert (await cloud.call("screen.show_scene", long))[1] is not None
             assert screen.state.scene is None

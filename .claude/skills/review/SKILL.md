@@ -35,6 +35,7 @@ A failing check is a finding; fix it before reading further.
 - `protocol/` changed first, then both sides, with `vocabulary.json` and the tests that compare against it.
 - Data is plain JSON: finite numbers only (JSON has no NaN), string keys, no dates or other objects. It is checked where it is made (`ports.screen.scene_data`, `core/checks.py`), not when it is sent; a bad value must fail at the publisher, never stop the robot from inside another module.
 - What does a page get on its first connection, before any state, and after a reconnect? Old pages and unknown fields are handled.
+- Schemas are checked through `core/data.py`'s `Schema`, never a bare validator: Python's `$` also matches before a last newline, which JSON Schema's, ECMA-262's, does not, and jsonschema's messages quote the value. A problem is logged and sent, so it names where and the rule broken, never the value, which may be a password or a token.
 
 ### Python modules (`software/src/ai_robot/`)
 
@@ -71,7 +72,7 @@ A failing check is a finding; fix it before reading further.
 
 ## 4. Confirm, then fix
 
-For each suspicion, write the smallest script that shows it: `python -c` against the package, or a scratch page or script in the session's scratchpad. Drop whatever does not reproduce. Fix what does in the pull request's single commit (`git commit --amend`, `git push --force-with-lease`), adding a test for it.
+For each suspicion, write the smallest script that shows it: `python -c` against the package, or a scratch page or script in the session's scratchpad. Drop whatever does not reproduce. A search that finds nothing proves nothing until it has found a sample planted for it: a regular expression in a shell command can lose a backslash on the way. Fix what does in the pull request's single commit (`git commit --amend`, `git push --force-with-lease`), adding a test for it.
 
 ## 5. Report
 
