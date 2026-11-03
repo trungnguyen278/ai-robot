@@ -25,7 +25,8 @@ concurrency:
 jobs:
   test:
     name: Python ${{ matrix.python-version }}
-    runs-on: ubuntu-latest
+    # The robot's own OS (docs/decisions/0017-ros-2.md), not whatever ubuntu-latest becomes.
+    runs-on: ubuntu-26.04
     strategy:
       fail-fast: false
       matrix:
@@ -45,7 +46,22 @@ jobs:
       - name: System libraries (PortAudio, the TPM's); a software TPM and a D-Bus for the tests
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libportaudio2 libtss2-dev swtpm dbus-daemon
+          sudo apt-get install -y --no-install-recommends libportaudio2 libtss2-dev swtpm dbus-daemon pipewire pipewire-pulse
+      - name: PipeWire, without which PortAudio does not start on Ubuntu 26.04 (ADR-0013, ADR-0017)
+        run: |
+          runtime="$RUNNER_TEMP/xdg"
+          mkdir -m 700 -p "$runtime"
+          echo "XDG_RUNTIME_DIR=$runtime" >> "$GITHUB_ENV"
+          export XDG_RUNTIME_DIR="$runtime"
+          nohup pipewire > "$RUNNER_TEMP/pipewire.log" 2>&1 &
+          nohup pipewire-pulse > "$RUNNER_TEMP/pipewire-pulse.log" 2>&1 &
+          for _ in $(seq 100); do
+            if [ -S "$runtime/pulse/native" ]; then exit 0; fi
+            sleep 0.1
+          done
+          echo "PipeWire's PulseAudio server did not start" >&2
+          cat "$RUNNER_TEMP"/pipewire*.log >&2
+          exit 1
       - name: Install
         run: python -m pip install -e ".[dev,tpm]"
       - name: LiveKit server, for the tests of conversations' rooms
