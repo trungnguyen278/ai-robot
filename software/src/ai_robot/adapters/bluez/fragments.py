@@ -11,6 +11,9 @@ FIRST = 0x80
 LAST = 0x40
 LENGTH_BYTES = 2
 ATT_OVERHEAD = 3  # bytes of a write or an indication that are not its value (Bluetooth Core)
+# The longest attribute value (Bluetooth Core, Vol 3, Part F, 3.2.9): BlueZ refuses a longer
+# write, and cuts a longer indication (BT_ATT_MAX_VALUE_LEN in src/shared/att-types.h, 5.85).
+MAX_VALUE = 512
 
 
 class FragmentError(Exception):
@@ -19,10 +22,10 @@ class FragmentError(Exception):
 
 def split(message: bytes, mtu: int) -> list[bytes]:
     """``message`` in fragments that each fit a write or an indication on a link whose ATT
-    MTU is ``mtu``."""
+    MTU is ``mtu``, and an attribute's value."""
     if not message or len(message) > MAX_MESSAGE:
         raise ValueError(f"a message has 1 to {MAX_MESSAGE} bytes, got {len(message)}")
-    room = mtu - ATT_OVERHEAD - 1  # the flags take a byte
+    room = min(mtu - ATT_OVERHEAD, MAX_VALUE) - 1  # the flags take a byte
     if room <= LENGTH_BYTES:
         raise ValueError(f"an ATT MTU of {mtu} leaves no room for a message")
     first = message[: room - LENGTH_BYTES]
@@ -34,12 +37,12 @@ def split(message: bytes, mtu: int) -> list[bytes]:
 
 
 class Joiner:
-    """Joins one peer's fragments into its messages."""
+    """Joins one peer's fragments into its messages. It holds the announced length at
+    most, however many fragments come: one without bytes adds nothing."""
 
     def __init__(self) -> None:
-        self._parts: list[bytes] = []
+        self._message = bytearray()
         self._expected = 0  # bytes of the message being joined; 0 between messages
-        self._received = 0
 
     def add(self, fragment: bytes) -> bytes | None:
         """Take the next fragment; return the message it completes, if any.
@@ -55,18 +58,17 @@ class Joiner:
             length = int.from_bytes(data[:LENGTH_BYTES], "big")
             if not 1 <= length <= MAX_MESSAGE:
                 raise FragmentError(f"a message has 1 to {MAX_MESSAGE} bytes, not {length}")
-            self._expected, self._parts, self._received = length, [], 0
+            self._expected, self._message = length, bytearray()
             data = data[LENGTH_BYTES:]
         elif not self._expected:
             raise FragmentError("a fragment came with no first one")
-        self._parts.append(data)
-        self._received += len(data)
-        if self._received > self._expected:
+        if len(self._message) + len(data) > self._expected:
             raise FragmentError("a message is longer than its length")
+        self._message += data
         if not flags & LAST:
             return None
-        if self._received != self._expected:
+        if len(self._message) != self._expected:
             raise FragmentError("a message is shorter than its length")
-        message = b"".join(self._parts)
-        self._expected, self._parts = 0, []
+        message = bytes(self._message)
+        self._expected, self._message = 0, bytearray()
         return message

@@ -13,7 +13,15 @@ from typing import Any
 import pytest
 
 from ai_robot.core.config import platform_dir
-from ai_robot.core.data import Schema, ecma_end, encode, frozen, plain
+from ai_robot.core.data import (
+    JSON_DEPTH,
+    Schema,
+    ecma_end,
+    encode,
+    frozen,
+    plain,
+    read_json,
+)
 
 # The protocols whose schemas the robot reads (platform/protocols/).
 PROTOCOLS = ("cloud", "setup")
@@ -150,3 +158,48 @@ def test_the_protocols_patterns_read_alike_in_python_and_ecma_262(protocol: str)
 @pytest.mark.parametrize("pattern", [r"^\d+$", r"^\w$", r"a\sb", r"\bx"])
 def test_a_shorthand_would_be_noticed(pattern: str) -> None:
     assert SHORTHANDS.search(pattern) is not None
+
+
+def nested(levels: int, value: Any = 0) -> Any:
+    """``value`` in ``levels`` arrays and objects, by turns."""
+    for level in range(levels):
+        value = [value] if level % 2 else {"x": value}
+    return value
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        {"a": ["[" * 100 + '"' + "\\" + "{" * 100, "]"]},  # brackets in strings
+        chr(0x1F600),  # a pair of surrogates, once escaped
+        {"": [1, -2.5, 1e308, None, True, "x"]},
+        nested(JSON_DEPTH),
+        [[0]] * (JSON_DEPTH * 2),  # wide, not deep
+    ],
+)
+def test_json_every_side_can_hold_is_read(value: Any) -> None:
+    for ascii_only in (True, False):
+        text = json.dumps(value, ensure_ascii=ascii_only)
+        assert read_json(text) == value and read_json(text.encode("utf-8")) == value
+
+
+@pytest.mark.parametrize(
+    ("text", "rule"),
+    [
+        (bytes([0xFF]), "not UTF-8"),
+        ("[1,]", "not JSON"),
+        ("NaN", "NaN is not JSON"),
+        ("[-Infinity]", "Infinity is not JSON"),
+        ("[1e999]", "past a double"),
+        ('"secret\\u0000"', "U[+]0000"),
+        ('{"a": "secret\\udc00"}', "lone surrogate"),
+        ('{"secret\\ud800": 1}', "lone surrogate"),  # in a name
+        ('["\\ud800\\ud800"]', "lone surrogate"),  # two highs are no pair
+        (json.dumps(nested(JSON_DEPTH + 1)), "deeper than 64"),
+        ("[" * (JSON_DEPTH + 1), "deeper than 64"),  # however far a parser would get
+    ],
+)
+def test_json_that_not_every_side_can_hold_is_refused(text: str | bytes, rule: str) -> None:
+    with pytest.raises(ValueError, match=rule) as refused:
+        read_json(text)
+    assert "secret" not in str(refused.value)

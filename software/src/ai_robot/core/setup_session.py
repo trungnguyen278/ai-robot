@@ -24,12 +24,12 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
-from ai_robot.core.data import Schema, encode
+from ai_robot.core.data import Schema, encode, read_json
 from ai_robot.core.jose import b64url, b64url_decode
 from ai_robot.core.spake2plus import ExchangeError, Prover, Verifier, record, stretch
 
 # Fixed by the protocol (platform/protocols/setup/README.md).
-PROTOCOL = "2.0"
+PROTOCOL = "2.1"
 CONTEXT_LABEL = b"ai-platform/setup/2"  # starts the context of the exchange
 KEYS_INFO = b"ai-platform/setup/2 keys"  # HKDF's info for the session keys
 KEY_BYTES = 16  # each side's AES-128-GCM key
@@ -136,16 +136,21 @@ class Records:
         return plaintext
 
 
-def _parse(data: bytes, schema: Schema) -> dict[str, Any]:
-    """A message, checked against ``schema``; ``Refusal`` if it is not one."""
-    try:
-        message = json.loads(data.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError):
-        raise Refusal("protocol", "a message is not JSON", fatal=True) from None
-    problem = schema.problem(message)
-    if problem is not None:
-        raise Refusal("protocol", f"a message breaks the schema: {problem}", fatal=True)
-    return message
+class SetupSchema:
+    """Set-up's schema, as the robot reads the app's messages with it: whole, and a
+    message's number alone, which an error can answer only once it can be read."""
+
+    NAME = "platform/protocols/setup/schema.json"
+
+    def __init__(self, root: Mapping[str, Any]) -> None:
+        self.from_app = Schema(self.NAME, {**root, "$ref": "#/$defs/from_app"})
+        self.seq = Schema(self.NAME, {**root, "$ref": "#/$defs/seq"})
+
+
+def _sized(data: bytes) -> bytes:
+    if len(data) > MAX_MESSAGE:
+        raise Refusal("protocol", "a message is too long", fatal=True)
+    return data
 
 
 def _bytes_of(field: str, text: str) -> bytes:
@@ -162,32 +167,16 @@ class Stage(Enum):
     OPEN = auto()  # the exchange is done: messages are encrypted
 
 
-class Session:
-    """The robot's side of one session. ``receive`` takes each message the app sends, as
-    it came, and returns what to send back; the module answers the requests."""
+class Messages:
+    """One app's messages, as the robot reads them, and the robot's own to that app, which
+    it numbers from 1 (the protocol's Before the exchange). An answer, and an error,
+    replies to the message the robot takes, whose ``seq`` is ``answering`` once it can be
+    read: an error about a message that cannot be read has no ``reply_to``."""
 
-    def __init__(
-        self,
-        secret: Secret,
-        discriminator: str,
-        schema: Schema,
-        scalar: int | None = None,  # y; random unless a test replays known values
-    ) -> None:
-        self._secret = secret
-        self._discriminator = discriminator
+    def __init__(self, schema: SetupSchema) -> None:
         self._schema = schema
-        self._scalar = scalar
-        self.stage = Stage.HELLO
-        self._app_hello = b""
-        self._verifier: Verifier | None = None
-        self._records: Records | None = None
         self._numbers = 0
-
-    @property
-    def attempted(self) -> bool:
-        """Whether the app sent its share: an attempt with the code, which fails unless the
-        session confirms it."""
-        return self.stage in (Stage.CONFIRM, Stage.OPEN)
+        self.answering: int | None = None
 
     def message(self, kind: str, reply_to: int | None = None, **fields: Any) -> dict[str, Any]:
         """A message of the robot's, with its number: ``seq``, from 1 in each session."""
@@ -198,15 +187,66 @@ class Session:
         message.update(fields)
         return message
 
-    def error(self, refusal: Refusal, reply_to: int | None = None) -> bytes:
-        """The error message for ``refusal``, ready to send, its text cut to what the
-        protocol allows."""
+    def error(self, refusal: Refusal) -> bytes:
+        """The error message for ``refusal``, ready to send, replying to the message the
+        robot takes if it could be read, its text cut to what the protocol allows."""
         text = refusal.message[:MAX_ERROR]
-        return self.pack(self.message("error", reply_to, code=refusal.code, message=text))
+        return self.pack(self.message("error", self.answering, code=refusal.code, message=text))
+
+    def pack(self, message: Mapping[str, Any]) -> bytes:
+        """``message`` as sent: JSON."""
+        return encode(message).encode("utf-8")
+
+    def read(self, data: bytes) -> dict[str, Any]:
+        """The app's next message, in the clear, checked against the schema. ``Refusal``
+        for one that breaks it, and, without anything to reply to, for one that cannot be
+        read: not JSON that every side can hold (ai-platform's ADR-0014), not an object,
+        or without a ``seq`` (the protocol's Errors). Every such refusal ends the
+        session."""
+        self.answering = None
+        try:
+            message = read_json(_sized(data))
+        except ValueError as error:
+            raise Refusal("protocol", f"a message cannot be read: {error}", fatal=True) from None
+        seq = message.get("seq") if isinstance(message, dict) else None
+        if self._schema.seq.problem(seq) is not None:
+            raise Refusal("protocol", "a message is not an object with a seq", fatal=True)
+        self.answering = int(seq)  # an integer, even if it came as 1.0
+        problem = self._schema.from_app.problem(message)
+        if problem is not None:
+            raise Refusal("protocol", f"a message breaks the schema: {problem}", fatal=True)
+        return message
+
+
+class Session(Messages):
+    """The robot's side of one session. ``receive`` takes each message the app sends, as
+    it came, and returns what to send back; the module answers the requests."""
+
+    def __init__(
+        self,
+        secret: Secret,
+        discriminator: str,
+        schema: SetupSchema,
+        scalar: int | None = None,  # y; random unless a test replays known values
+    ) -> None:
+        super().__init__(schema)
+        self._secret = secret
+        self._discriminator = discriminator
+        self._scalar = scalar
+        self.stage = Stage.HELLO
+        self._app_hello = b""
+        self._verifier: Verifier | None = None
+        self._records: Records | None = None
+
+    @property
+    def attempted(self) -> bool:
+        """Whether the app sent its share: an attempt with the code, which fails unless the
+        session confirms it."""
+        return self.stage in (Stage.CONFIRM, Stage.OPEN)
 
     def pack(self, message: Mapping[str, Any]) -> bytes:
         """``message`` as sent: JSON, encrypted once the exchange is done."""
-        data = encode(message).encode("utf-8")
+        data = super().pack(message)
         return data if self._records is None else self._records.seal(data)
 
     def receive(self, data: bytes) -> tuple[bytes | None, dict[str, Any] | None]:
@@ -214,10 +254,9 @@ class Session:
         once it is done, the request for the module to answer. ``Refusal`` for a message
         out of place: the module answers it, and ends the session if it is fatal; ``Ended``
         when the app ends the session."""
-        if len(data) > MAX_MESSAGE:
-            raise Refusal("protocol", "a message is too long", fatal=True)
-        plaintext = data if self._records is None else self._records.open(data)
-        message = _parse(plaintext, self._schema)
+        self.answering = None
+        plaintext = _sized(data) if self._records is None else self._records.open(_sized(data))
+        message = self.read(plaintext)
         if message["type"] == "error":
             raise Ended(f"the app ended the session: {message['code']}")
         if self._records is not None:
@@ -348,9 +387,11 @@ def ssid_bytes(message: Mapping[str, Any]) -> bytes:
 
 
 def ssid_fields(name: bytes) -> dict[str, str]:
-    """How a message names the network ``name``: ``ssid`` if it is UTF-8, else
+    """How a message names the network ``name``, as it came from the air: ``ssid`` if it is
+    text that every side can hold, UTF-8 without a U+0000 (ai-platform's ADR-0014), else
     ``ssid_hex``."""
     try:
-        return {"ssid": name.decode("utf-8")}
+        text = name.decode("utf-8")
     except UnicodeDecodeError:
         return {"ssid_hex": name.hex()}
+    return {"ssid_hex": name.hex()} if "\0" in text else {"ssid": text}

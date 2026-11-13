@@ -14,16 +14,18 @@ from typing import Any, TypeVar
 from ai_robot import software_version
 from ai_robot.core.checks import positive
 from ai_robot.core.config import platform_dir
-from ai_robot.core.data import Schema, encode
 from ai_robot.core.module import Module, ModuleContext
 from ai_robot.core.settings import SettingsHost
 from ai_robot.core.setup_session import (
     CODE_DIGITS,
     DISCRIMINATOR_DIGITS,
+    SSID_BYTES,
     Ended,
+    Messages,
     Refusal,
     Secret,
     Session,
+    SetupSchema,
     Stage,
     draw_discriminator,
     new_secret,
@@ -47,7 +49,7 @@ from ai_robot.messages import (
     SettingsOpened,
 )
 from ai_robot.ports.network import JoinError, Network, NetworkState, NetworkStatus, Security
-from ai_robot.ports.setup import Connected, Disconnected, Received, SetupLink
+from ai_robot.ports.setup import Connected, Received, SetupLink
 
 SCENE = "setup"  # the screen's set-up scene (protocol/screen/vocabulary.json)
 LINK_LENGTH = 256  # characters the scene's link may have, as in the vocabulary
@@ -62,13 +64,21 @@ REGISTRATION_TIMEOUT = 10.0  # seconds cloud has to sign a registration
 CONFIGURE_TIMEOUT = 10.0  # seconds system has to take the languages and the time zone
 
 
-def _load_schema() -> Schema:
+def _load_schema() -> SetupSchema:
     path = platform_dir() / "setup" / "schema.json"
     try:
         schema = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as error:
         raise ValueError(f"cannot read the set-up protocol's schema: {error}") from None
-    return Schema("platform/protocols/setup/schema.json", {**schema, "$ref": "#/$defs/from_app"})
+    return SetupSchema(schema)
+
+
+def _hidden(name: bytes) -> bool:
+    """Whether a scan found ``name`` for a hidden network: no bytes, NUL bytes alone, as
+    hostapd's ``ignore_broadcast_ssid=2`` sends, or a single space, as NetworkManager
+    reads them all (``_nm_utils_is_empty_ssid_arr``, ``src/libnm-glib-aux/nm-shared-utils.c``
+    on its ``main``, read 2026-11-13)."""
+    return not name.strip(b"\0") or name == b" "
 
 
 def _network_fields(status: NetworkStatus) -> dict[str, Any]:
@@ -99,9 +109,11 @@ class SetupModule(Module):
     - **The code.** Each opening draws a discriminator and a code; each attempt with
       the code, successful or not, draws a new code. The screen's ``setup`` scene shows
       them, and ``link`` wraps the set-up string for the QR code.
-    - **The session.** One app at a time; another gets the error ``busy``. A session
-      that sends nothing for ``idle`` seconds ends. Joining a network may take
-      ``join_timeout`` seconds.
+    - **The session.** One app at a time: the first whose ``hello`` comes. Another app's
+      ``hello`` gets the error ``busy``, which reaches that app only, and the robot drops
+      it; an app that connects once set-up has closed is dropped with no message. An app
+      that sends no whole message for ``idle`` seconds is dropped. Joining a network may
+      take ``join_timeout`` seconds.
     - **The registration.** ``cloud``, which owns the robot's key, signs it
       (``RegistrationRequested``, ``RegistrationSigned``). Once the app finishes, the
       screen shows that the robot is connecting, until the server accepts it, or for
@@ -163,7 +175,7 @@ class SetupModule(Module):
         self._locales = self.bus.subscribe(LocaleChanged)
         self._applied = self.bus.subscribe(LocaleApplied)
         self.locale: LocaleChanged | None = None  # the robot's languages and time zone
-        self._schema: Schema | None = None
+        self._schema: SetupSchema | None = None
         self.robot_id: str | None = None
         self.bound: bool | None = None  # None until cloud says
         self.is_open = False
@@ -173,10 +185,11 @@ class SetupModule(Module):
         self.failures = 0
         self.discriminator = ""
         self._secret: Secret | None = None
-        self.peer: str | None = None
+        self.peer: str | None = None  # the app whose session runs
         self._session: Session | None = None
-        self._inbox: asyncio.Queue[bytes | None] = asyncio.Queue()
-        self._serving: asyncio.Task[None] | None = None
+        # The messages of each app connected now, whole, then None once it has left.
+        self._inboxes: dict[str, asyncio.Queue[bytes | None]] = {}
+        self._apps: set[asyncio.Task[None]] = set()  # each serves one app connected
         self._pending: dict[str, asyncio.Future[RegistrationSigned]] = {}
         self._configuring: dict[str, asyncio.Future[LocaleApplied]] = {}
         self._numbers = itertools.count(1)
@@ -210,10 +223,10 @@ class SetupModule(Module):
 
     async def stop(self) -> None:
         self.settings.close()
-        if self._serving is not None:
-            self._serving.cancel()
+        for app in list(self._apps):
+            app.cancel()
             with contextlib.suppress(asyncio.CancelledError):
-                await self._serving
+                await app
         if self.is_open:
             await self._link("stop the set-up service", self.link.stop())
 
@@ -393,53 +406,82 @@ class SetupModule(Module):
         while True:
             event = await self.link.event()
             if isinstance(event, Connected):
-                if not self.is_open or self.peer is not None or self._secret is None:
-                    await self._refuse(event.peer)
+                if not self.is_open:
+                    # No message: busy would send the person to wait, where the robot
+                    # needs opening again (the protocol's When set-up is open).
+                    await self._link("drop an app", self.link.drop(event.peer))
                     continue
-                self.peer = event.peer
-                self._inbox = asyncio.Queue()
-                await self._link("stop advertising", self.link.advertise(False))
-                self._serving = asyncio.create_task(
-                    self._serve(event.peer, self._secret, self._inbox), name="set-up session"
-                )
+                inbox: asyncio.Queue[bytes | None] = asyncio.Queue()
+                self._inboxes[event.peer] = inbox
+                app = asyncio.create_task(self._greet(event.peer, inbox), name="set-up app")
+                self._apps.add(app)
+                app.add_done_callback(self._apps.discard)
             elif isinstance(event, Received):
-                if event.peer == self.peer:
-                    self._inbox.put_nowait(event.message)
-            elif isinstance(event, Disconnected) and event.peer == self.peer:
-                self._inbox.put_nowait(None)
+                if event.peer in self._inboxes:
+                    self._inboxes[event.peer].put_nowait(event.message)
+            elif (left := self._inboxes.pop(event.peer, None)) is not None:
+                left.put_nowait(None)
 
-    async def _refuse(self, peer: str) -> None:
-        busy = {"type": "error", "seq": 1, "code": "busy", "message": "set-up is busy or closed"}
-        await self._link("answer an app", self.link.send(peer, encode(busy).encode("utf-8")))
+    async def _greet(self, peer: str, inbox: asyncio.Queue[bytes | None]) -> None:
+        """Serve an app that connected, from its first whole message, its ``hello``: the
+        session, if none runs; otherwise ``busy``, to this app only, and the robot drops
+        it, while the session goes on (the protocol's Errors)."""
+        try:
+            first = await asyncio.wait_for(inbox.get(), self.idle)
+        except TimeoutError:
+            self.log.info("an app sent nothing to set-up, and was dropped")
+            await self._link("drop an app", self.link.drop(peer))
+            return
+        if first is None:  # it left
+            return
+        if not self.is_open:  # it connected as set-up closed, and stayed
+            await self._link("drop an app", self.link.drop(peer))
+        elif self.peer is None and self._secret is not None:
+            self.peer = peer
+            await self._link("stop advertising", self.link.advertise(False))
+            await self._serve(peer, self._secret, inbox, first)
+        else:
+            await self._refuse(peer, first)
+
+    async def _refuse(self, peer: str, first: bytes) -> None:
+        """Answer the first message of an app that finds set-up busy, then drop it."""
+        assert self._schema is not None
+        messages = Messages(self._schema)
+        try:
+            hello = messages.read(first)
+            if hello["type"] != "hello":
+                raise Refusal("protocol", f"expected hello, got {hello['type']}")
+            refusal = Refusal("busy", "another set-up session runs")
+        except Refusal as refused:
+            refusal = refused
+        await self._link("answer an app", self.link.send(peer, messages.error(refusal)))
         await self._link("drop an app", self.link.drop(peer))
 
     # ---- one session ----
 
-    async def _serve(self, peer: str, secret: Secret, inbox: asyncio.Queue[bytes | None]) -> None:
+    async def _serve(
+        self, peer: str, secret: Secret, inbox: asyncio.Queue[bytes | None], first: bytes
+    ) -> None:
         assert self._schema is not None
         session = Session(secret, self.discriminator, self._schema)
         self._session = session
         finished = False
         try:
-            finished = await self._converse(peer, session, inbox)
+            finished = await self._converse(peer, session, inbox, first)
         except Exception:  # set-up must outlive a failing session
             self.log.exception("a set-up session failed")
         finally:
             await self._after(peer, session, finished)
 
     async def _converse(
-        self, peer: str, session: Session, inbox: asyncio.Queue[bytes | None]
+        self, peer: str, session: Session, inbox: asyncio.Queue[bytes | None], first: bytes
     ) -> bool:
-        """Serve the session until it ends. Returns whether the app finished."""
+        """Serve the session, from the app's ``first`` message, until it ends. Returns
+        whether the app finished. Only whole messages keep it from being idle."""
+        data: bytes | None = first
         while True:
-            try:
-                data = await asyncio.wait_for(inbox.get(), self.idle)
-            except TimeoutError:
-                self.log.info("a set-up session was idle, and ended")
-                return False
             if data is None:  # the app left
                 return False
-            reply_to: int | None = None
             try:
                 reply, request = session.receive(data)
                 if reply is not None:
@@ -447,9 +489,7 @@ class SetupModule(Module):
                 elif request is None:  # the exchange is done
                     self.log.info("an app opened a set-up session")
                     self._show()
-                    continue
                 if request is not None:
-                    reply_to = request["seq"]
                     answer = await self._answer(session, request)
                     await self.link.send(peer, session.pack(answer))
                     if request["type"] == "finish":
@@ -458,10 +498,15 @@ class SetupModule(Module):
                 self.log.info("%s", ended)
                 return False
             except Refusal as refusal:
-                await self.link.send(peer, session.error(refusal, reply_to))
+                await self.link.send(peer, session.error(refusal))
                 if refusal.fatal:
                     self.log.info("a set-up session ended: %s", refusal.message)
                     return False
+            try:
+                data = await asyncio.wait_for(inbox.get(), self.idle)
+            except TimeoutError:
+                self.log.info("a set-up session was idle, and ended")
+                return False
 
     async def _after(self, peer: str, session: Session, finished: bool) -> None:
         """Once a session ends: count a failed attempt, draw a new code, close set-up or
@@ -471,10 +516,10 @@ class SetupModule(Module):
         if failed:
             self.failures += 1
             self.log.warning("a set-up attempt failed (%d so far)", self.failures)
+        await self._link("drop an app", self.link.drop(peer))
         if self.is_open and session.attempted and not finished:
             self._secret = await new_secret()  # each code serves one attempt
         self.peer = None
-        await self._link("drop an app", self.link.drop(peer))
         if finished or self.failures >= self.attempts:
             await self._close()
         elif self.is_open:
@@ -526,7 +571,7 @@ class SetupModule(Module):
     async def _networks(self) -> list[dict[str, Any]]:
         found = []
         for network in await self._network(self.network.scan()):
-            if not 1 <= len(network.ssid) <= 32:  # a hidden network shows no name
+            if _hidden(network.ssid) or len(network.ssid) > SSID_BYTES:
                 continue
             fields = {"security": network.security.value, "signal": network.signal}
             found.append({**ssid_fields(network.ssid), **fields, "saved": network.saved})
