@@ -64,6 +64,7 @@ A failing check is a finding; fix it before reading further.
 ### System services and the Pi's set-up (`adapters/`, `tools/pi/`)
 
 - A change that relies on how a system service behaves (BlueZ, NetworkManager) is checked against the version Ubuntu 26.04 ships, with Ubuntu's patches, not against upstream's newest. It runs on the Pi with as many clients as the feature serves: the fakes model the documented behaviour, not a version's bugs. Two apps at once found that BlueZ 5.85 closed one app's channel when the other left (ADR-0020).
+- A D-Bus signal counts only when its sender is the service's current unique name (`Owner.sent`, `adapters/dbus.py`): a match rule's `sender` filters broadcasts only, and the system bus lets any connection send a signal to the robot alone. The owner is followed through `NameOwnerChanged`, so the robot recovers when the service restarts instead of being restarted with it.
 - Set-up scripts in `tools/pi/` ask for no root: they print the root commands, which the README lists too.
 
 ### Tests

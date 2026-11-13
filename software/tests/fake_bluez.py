@@ -8,6 +8,12 @@ A phone that enables indications has BlueZ call ``AcquireNotify``, which hands B
 end of a socket pair: BlueZ indicates each packet read from it, of 512 bytes at most, to
 that phone, and writes one byte, 0x01, for each confirmation (``sock_io_read`` and
 ``sock_io_write``). It closes its end when the phone disables indications or disconnects.
+
+BlueZ offers its managers on the controller's object, and says when they come and go
+(``InterfacesAdded`` and ``InterfacesRemoved`` from its object manager, at its root). The
+advertising manager comes once the controller has told its features
+(``read_adv_features_callback``, src/advertising.c). BlueZ forgets every registration when
+it stops, or when the controller goes away (``adapter_remove``, src/adapter.c).
 """
 
 from __future__ import annotations
@@ -28,6 +34,8 @@ BLUEZ = "org.bluez"
 ADAPTER = "/org/bluez/hci0"
 GATT_MANAGER = "org.bluez.GattManager1"
 ADVERTISING_MANAGER = "org.bluez.LEAdvertisingManager1"
+MANAGERS = ("org.bluez.Adapter1", GATT_MANAGER, ADVERTISING_MANAGER)
+OBJECT_MANAGER = "org.freedesktop.DBus.ObjectManager"
 DEVICE = "org.bluez.Device1"
 CHARACTERISTIC = "org.bluez.GattCharacteristic1"
 PROPERTIES = "org.freedesktop.DBus.Properties"
@@ -55,16 +63,28 @@ class FakeBluez:
     interface -> properties), and ``advertisement`` the properties of its advertisement
     while it advertises. ``refuse`` makes the next registration fail. Phones are named
     by their device's object path; those in ``silent`` do not confirm indications.
+    ``managers`` holds the interfaces the controller's object offers. ``late`` names
+    interfaces that come as BlueZ lists its objects, after the listing; ``hold`` keeps
+    listings unanswered; ``vanish`` names interfaces that go away as BlueZ answers the
+    next registration, which BlueZ then loses if it needed them. ``registrations`` tells
+    each registration and unregistration, in order.
     """
 
     def __init__(self, address: str) -> None:
         self.address = address
         self.bus: MessageBus | None = None
+        self.managers: set[str] = set()
         self.application: dict[str, dict[str, dict[str, Any]]] = {}
         self.advertisement: dict[str, Any] | None = None
         self.robot = ""  # the robot's unique name on the bus
         self.disconnected: list[str] = []  # devices the robot asked to disconnect
         self.refuse = False
+        self.refuse_advertisement = False
+        self.late: set[str] = set()
+        self.hold = False
+        self.held: list[Message] = []  # listings not answered
+        self.vanish: tuple[str, ...] = ()
+        self.registrations: list[str] = []
         self.refuse_all = False  # every call to the controller fails
         self.silent: set[str] = set()
         # Each phone's indications, and the channels the robot closed, in order.
@@ -78,16 +98,56 @@ class FakeBluez:
         self._shut: set[socket.socket] = set()  # the ends BlueZ shut down
         self._tasks: set[asyncio.Task[None]] = set()
 
-    async def start(self) -> None:
+    async def start(self, offers: tuple[str, ...] = MANAGERS) -> None:
+        """Start, on a connection of its own: again after ``stop``, as a BlueZ that
+        restarts, which knows nothing of before."""
+        self.application, self.advertisement, self.robot = {}, None, ""
         self.bus = await MessageBus(bus_address=self.address, negotiate_unix_fd=True).connect()
-        await self.bus.request_name(BLUEZ)
         self.bus.add_message_handler(self._handle)
+        await self.bus.request_name(BLUEZ)
+        if offers:
+            self.add(*offers)
 
     async def stop(self) -> None:
+        """Stop, as bluetoothd exits: its channels close, and it leaves the bus."""
         for task in list(self._tasks):
             task.cancel()
+        self._channels.clear()
+        self.managers.clear()
         if self.bus is not None:
             self.bus.disconnect()
+            await self.bus.wait_for_disconnect()
+
+    def add(self, *interfaces: str) -> None:
+        """The controller's object offers ``interfaces``."""
+        assert self.bus is not None
+        self.managers.update(interfaces)
+        self.bus.send(
+            Message.new_signal(
+                "/",
+                OBJECT_MANAGER,
+                "InterfacesAdded",
+                "oa{sa{sv}}",
+                [ADAPTER, {interface: {} for interface in interfaces}],
+            )
+        )
+
+    def remove(self, *interfaces: str) -> None:
+        """The controller's object no longer offers ``interfaces``: all of them when the
+        controller goes away, and what was registered with them is forgotten."""
+        assert self.bus is not None
+        self.managers.difference_update(interfaces)
+        if GATT_MANAGER in interfaces:
+            self.application = {}
+            for device in list(self._channels):
+                self.unsubscribe(device)
+        if ADVERTISING_MANAGER in interfaces:
+            self.advertisement = None
+        self.bus.send(
+            Message.new_signal(
+                "/", OBJECT_MANAGER, "InterfacesRemoved", "oas", [ADAPTER, list(interfaces)]
+            )
+        )
 
     # ---- what the robot asks of BlueZ ----
 
@@ -105,14 +165,33 @@ class FakeBluez:
         call = (message.interface, message.member)
         if self.refuse_all and message.path.startswith(ADAPTER):
             self._error(message, "org.bluez.Error.Failed", "refused for the test")
+        elif message.interface in MANAGERS and (
+            message.path != ADAPTER or message.interface not in self.managers
+        ):
+            self._error(message, "org.freedesktop.DBus.Error.UnknownObject", "no such object")
+        elif call == (OBJECT_MANAGER, "GetManagedObjects") and message.path == "/":
+            if self.hold:
+                self.held.append(message)
+                return True
+            objects = {ADAPTER: {name: {} for name in self.managers}} if self.managers else {}
+            if self.late:
+                self.add(*self.late)
+                self.late = set()
+            self.bus.send(Message.new_method_return(message, "a{oa{sa{sv}}}", [objects]))
+        elif (call == (GATT_MANAGER, "RegisterApplication") and self.application) or (
+            call == (ADVERTISING_MANAGER, "RegisterAdvertisement") and self.advertisement
+        ):
+            self._error(message, "org.bluez.Error.AlreadyExists", "registered already")
         elif call == (GATT_MANAGER, "RegisterApplication"):
             self._spawn(self._register_application(message))
         elif call == (GATT_MANAGER, "UnregisterApplication"):
+            self.registrations.append("-application")
             self.application = {}
             self._reply(message)
         elif call == (ADVERTISING_MANAGER, "RegisterAdvertisement"):
             self._spawn(self._register_advertisement(message))
         elif call == (ADVERTISING_MANAGER, "UnregisterAdvertisement"):
+            self.registrations.append("-advertisement")
             self.advertisement = None
             self._reply(message)
         elif call == (DEVICE, "Disconnect"):
@@ -134,7 +213,11 @@ class FakeBluez:
                 message.body[0], "org.freedesktop.DBus.ObjectManager", "GetManagedObjects", "", []
             )
         ).body
+        if self._vanished(GATT_MANAGER):
+            self._reply(message)
+            return
         self.application = plain(objects)
+        self.registrations.append("application")
         self._reply(message)
         await self.call(
             "/org/freedesktop/DBus",
@@ -156,8 +239,24 @@ class FakeBluez:
                 destination=message.sender,
             )
         ).body
+        if self.refuse_advertisement:
+            self.refuse_advertisement = False
+            self._error(message, "org.bluez.Error.Failed", "refused for the test")
+            return
+        if self._vanished(ADVERTISING_MANAGER):
+            self._reply(message)
+            return
         self.advertisement = plain(properties)
+        self.registrations.append("advertisement")
         self._reply(message)
+
+    def _vanished(self, manager: str) -> bool:
+        """The interfaces ``vanish`` names go, as BlueZ answers; whether ``manager``
+        did."""
+        vanish, self.vanish = self.vanish, ()
+        if vanish:
+            self.remove(*vanish)
+        return manager in vanish
 
     # ---- phones ----
 

@@ -11,7 +11,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from local_dbus import private_bus
+import waiting
+from local_dbus import impersonate, private_bus
 
 from ai_robot.ports.network import JoinError, JoinFailure, NetworkState, Security
 
@@ -171,6 +172,46 @@ def test_a_join_that_takes_too_long_is_abandoned(bus: str) -> None:
                 )
             assert error.value.failure is JoinFailure.OTHER
             assert "DeactivateConnection" in manager.calls and manager.profiles == {}
+
+    asyncio.run(main())
+
+
+def test_only_networkmanager_tells_the_state_of_the_device(bus: str) -> None:
+    """Another program's signal, sent to the robot alone, does not end a join."""
+    from dbus_fast import Message
+    from fake_networkmanager import CONFIG, DEVICE_PATH, FAILED, NEED_AUTH, NM, NO_SECRETS
+
+    async def main() -> None:
+        async with started(bus) as (manager, network):
+            manager.stall = True
+            joining = asyncio.create_task(
+                network.join(b"Home", "correct horse", hidden=False, security=None, timeout=1.0)
+            )
+            await waiting.until(
+                lambda: manager.state == CONFIG, timeout=5.0
+            )  # the join waits for news
+            for state in (NEED_AUTH, FAILED):
+                signal = Message.new_signal(
+                    DEVICE_PATH, f"{NM}.Device", "StateChanged", "uuu", [state, 0, NO_SECRETS]
+                )
+                signal.destination = network._bus.unique_name
+                await impersonate(bus, signal)
+            with pytest.raises(JoinError) as error:
+                await joining
+            assert error.value.failure is JoinFailure.OTHER  # it took too long
+
+    asyncio.run(main())
+
+
+def test_networkmanager_is_heard_after_it_restarts(bus: str) -> None:
+    async def main() -> None:
+        async with started(bus) as (manager, network):
+            await manager.stop()
+            await manager.start()  # on a new connection, with a new unique name
+            status = await network.join(
+                b"Home", "correct horse", hidden=False, security=None, timeout=5.0
+            )
+            assert status.state is NetworkState.CONNECTED
 
     asyncio.run(main())
 

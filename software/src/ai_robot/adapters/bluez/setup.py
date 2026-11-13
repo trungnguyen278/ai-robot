@@ -8,6 +8,12 @@ of a socket pair for that app alone: BlueZ indicates each packet the robot write
 other end, to that app only, and writes one byte back for each confirmation. It closes its
 end when the app disables indications or disconnects (BlueZ 5.85,
 doc/org.bluez.GattCharacteristic.rst and src/gatt-database.c).
+
+BlueZ forgets what the robot registered when it stops, as installing a ``bluez`` package
+does (its ``postinst``), or when the controller goes away. The link follows BlueZ's owner
+on the bus and the managers on the controller's object, as BlueZ's own client does
+(gdbus/client.c) and PipeWire (spa/plugins/bluez5/bluez5-dbus.c, 1.4.9): what BlueZ loses
+ends its apps, and the link registers it again once BlueZ offers its managers again.
 """
 
 # No `from __future__ import annotations` here: dbus-fast reads the annotations of the
@@ -18,7 +24,7 @@ import contextlib
 import functools
 import logging
 import socket
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Coroutine, Sequence
 from dataclasses import dataclass, field
 from typing import Annotated, Any
 
@@ -29,7 +35,7 @@ from dbus_fast.constants import PropertyAccess
 from dbus_fast.service import ServiceInterface, dbus_method, dbus_property
 
 from ai_robot.adapters.bluez.fragments import FragmentError, Joiner, split
-from ai_robot.adapters.dbus import call, connect, watch
+from ai_robot.adapters.dbus import OBJECT_MANAGER, Owner, call, connect, watch
 from ai_robot.core.checks import positive
 from ai_robot.ports.setup import Connected, Disconnected, LinkEvent, Received, SetupLink
 
@@ -226,7 +232,8 @@ class BluezSetupLink(SetupLink):
     ``confirm_timeout`` seconds of the robot's sending is dropped.
 
     Apps are named by their BlueZ device's object path. One connects with its first
-    write; it leaves when BlueZ says the device disconnected, or when it is dropped.
+    write; it leaves when BlueZ says the device disconnected, when BlueZ or the controller
+    goes away, or when it is dropped. The link acts only on signals that BlueZ sent.
     """
 
     def __init__(self, *, adapter: str, bus: str, confirm_timeout: float) -> None:
@@ -240,13 +247,23 @@ class BluezSetupLink(SetupLink):
         self._request = _Request(self)
         self._answer = _Answer(self)
         self._advertisement = _Advertisement()
+        self._bluez = Owner(BLUEZ)
+        self._managers: set[str] = set()  # the interfaces BlueZ offers on the controller
+        self._heard = 0  # changes of BlueZ or of them, so that an older listing undoes none
+        # What the robot offers: the service, from start to stop, and its advertisement.
         self._offered = False
+        self._advertising = False
+        # What BlueZ holds of it, and how often BlueZ lost some, so that a registration
+        # that ends after BlueZ lost it is not taken as held.
+        self._registered = False
         self._advertised = False
+        self._losses = 0
+        self._registering = asyncio.Lock()
         self._apps: dict[str, _App] = {}  # device path -> the app connected through it
         self._channels: dict[str, _Channel] = {}  # device path -> its channel for indications
         self._changed = asyncio.Event()  # set, then replaced, when a channel comes or an app leaves
         self._events: asyncio.Queue[LinkEvent] = asyncio.Queue()
-        self._tasks: set[asyncio.Task[None]] = set()  # drops started from BlueZ's calls
+        self._tasks: set[asyncio.Task[None]] = set()  # started from what BlueZ says
 
     @property
     def acquired(self) -> bool:
@@ -254,6 +271,8 @@ class BluezSetupLink(SetupLink):
         return bool(self._channels)
 
     async def open(self) -> None:
+        """Connect to the bus, and learn whether BlueZ runs and what it offers. BlueZ
+        need not run yet."""
         self._bus = await connect(self.bus_address, unix_fds=True)
         self._bus.add_message_handler(self._on_message)
         await watch(
@@ -261,14 +280,26 @@ class BluezSetupLink(SetupLink):
             f"type='signal',sender='{BLUEZ}',interface='{PROPERTIES}',"
             f"member='PropertiesChanged',path_namespace='{self.adapter_path}'",
         )
+        # BlueZ's object manager is its root's (attach_object_manager, gdbus/object.c).
+        await watch(
+            self._bus, f"type='signal',sender='{BLUEZ}',interface='{OBJECT_MANAGER}',path='/'"
+        )
         self._bus.export(SERVICE_PATH, self._service)
         self._bus.export(REQUEST_PATH, self._request)
         self._bus.export(ANSWER_PATH, self._answer)
         self._bus.export(ADVERTISEMENT_PATH, self._advertisement)
+        await self._bluez.follow(self._bus)
+        if self._bluez.unique is not None:
+            with contextlib.suppress(ConnectionError):  # it is leaving: it says so
+                await self._list()
 
     async def close(self) -> None:
         with contextlib.suppress(Exception):
             await self.stop()
+        tasks = list(self._tasks)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         for channel in list(self._channels.values()):
             channel.close()
         if self._bus is not None:
@@ -278,33 +309,28 @@ class BluezSetupLink(SetupLink):
     # ---- the port ----
 
     async def start(self, name: str) -> None:
+        """Offer the service, then advertise it. ``ConnectionError`` if BlueZ does not run,
+        does not offer both on the controller, or refuses: then nothing is offered."""
         self._advertisement.local = short_name(name)
-        if not self._offered:
-            await self._bluez(
-                self.adapter_path, GATT_MANAGER, "RegisterApplication", "oa{sv}", [ROOT, {}]
-            )
-            self._offered = True
-        await self.advertise(True)
+        if self._offered:
+            await self.advertise(True)
+            return
+        if not {GATT_MANAGER, ADVERTISING_MANAGER} <= self._managers:
+            raise ConnectionError("BlueZ offers no GATT service and advertising on the controller")
+        self._offered = self._advertising = True
+        try:
+            await self._sync()
+        except BaseException:
+            self._offered = self._advertising = False
+            with contextlib.suppress(ConnectionError):
+                await self._sync()
+            raise
 
     async def advertise(self, on: bool) -> None:
-        if on and self._offered and not self._advertised:
-            await self._bluez(
-                self.adapter_path,
-                ADVERTISING_MANAGER,
-                "RegisterAdvertisement",
-                "oa{sv}",
-                [ADVERTISEMENT_PATH, {}],
-            )
-            self._advertised = True
-        elif not on and self._advertised:
-            self._advertised = False
-            await self._bluez(
-                self.adapter_path,
-                ADVERTISING_MANAGER,
-                "UnregisterAdvertisement",
-                "o",
-                [ADVERTISEMENT_PATH],
-            )
+        """Advertise while the service is offered, or stop. While BlueZ is away, the link
+        keeps what it was asked, and advertises once BlueZ is back."""
+        self._advertising = on
+        await self._sync()
 
     async def stop(self) -> None:
         await self.advertise(False)
@@ -312,9 +338,8 @@ class BluezSetupLink(SetupLink):
             await self.drop(peer)
         for channel in list(self._channels.values()):  # apps that never wrote
             channel.close()
-        if self._offered:
-            self._offered = False
-            await self._bluez(self.adapter_path, GATT_MANAGER, "UnregisterApplication", "o", [ROOT])
+        self._offered = False
+        await self._sync()
 
     async def event(self) -> LinkEvent:
         return await self._events.get()
@@ -342,7 +367,7 @@ class BluezSetupLink(SetupLink):
             return
         self._left(peer)
         with contextlib.suppress(ConnectionError):  # it may be gone already
-            await self._bluez(peer, DEVICE, "Disconnect")
+            await self._bluez_call(peer, DEVICE, "Disconnect")
 
     # ---- what BlueZ tells the link ----
 
@@ -361,16 +386,15 @@ class BluezSetupLink(SetupLink):
             message = app.joiner.add(fragment)
         except FragmentError as error:
             log.warning("an app sent a fragment that does not fit (%s): dropped", error)
-            task = asyncio.get_running_loop().create_task(self.drop(peer))
-            self._tasks.add(task)
-            task.add_done_callback(self._tasks.discard)
+            self._spawn(self.drop(peer))
             return
         if message is not None:
             self._events.put_nowait(Received(peer, message))
 
     def _on_message(self, message: Message) -> bool | None:
-        """BlueZ asks for a channel, or a device's properties changed: one that
-        disconnects leaves."""
+        """BlueZ asks for a channel; BlueZ comes or goes; or it says what changed: the
+        managers it offers on the controller, or a device's connection. Only signals that
+        BlueZ sent count, as the bus says who sent each."""
         if message.message_type is MessageType.METHOD_CALL:
             if (message.path, message.interface, message.member) == (
                 ANSWER_PATH,
@@ -380,16 +404,115 @@ class BluezSetupLink(SetupLink):
                 self._acquire(message)
                 return True
             return None
-        if (
-            message.message_type is MessageType.SIGNAL
-            and message.member == "PropertiesChanged"
-            and message.body
-            and message.body[0] == DEVICE
-        ):
+        if self._bluez.changed(message):
+            self._heard += 1
+            if self._offered and self._bluez.unique is None:
+                log.warning("BlueZ stopped: set-up's apps are gone, and its service waits")
+            self._lose(self._managers)
+            if self._bluez.unique is not None:
+                self._spawn(self._restore())
+            return None
+        if message.message_type is not MessageType.SIGNAL or not self._bluez.sent(message):
+            return None
+        if message.member == "PropertiesChanged" and message.body and message.body[0] == DEVICE:
             connected = message.body[1].get("Connected")
             if connected is not None and not connected.value:
                 self._left(message.path)
+        elif (
+            message.interface == OBJECT_MANAGER
+            and message.body
+            and message.body[0] == self.adapter_path
+        ):
+            self._heard += 1
+            if message.member == "InterfacesAdded":
+                self._managers |= set(message.body[1])
+                self._spawn(self._restore(listed=True))
+            elif message.member == "InterfacesRemoved":
+                self._lose(set(message.body[1]))
         return None
+
+    def _lose(self, managers: set[str]) -> None:
+        """BlueZ no longer offers ``managers`` on the controller, and lost what the robot
+        registered with them. Apps leave with the GATT manager: the controller is gone."""
+        managers = set(managers)  # it may be the link's own set
+        self._managers -= managers
+        if not managers & {GATT_MANAGER, ADVERTISING_MANAGER}:
+            return
+        self._losses += 1
+        if ADVERTISING_MANAGER in managers:
+            self._advertised = False
+        if GATT_MANAGER in managers:
+            self._registered = False
+            for peer in list(self._apps):
+                self._left(peer)
+            for channel in list(self._channels.values()):
+                channel.close()
+
+    async def _list(self) -> None:
+        """Learn which managers BlueZ offers on the controller."""
+        while True:
+            heard = self._heard
+            (objects,) = await self._bluez_call("/", OBJECT_MANAGER, "GetManagedObjects")
+            if self._heard == heard:  # else a change came meanwhile: list again
+                self._managers = set(objects.get(self.adapter_path, {}))
+                return
+
+    async def _restore(self, *, listed: bool = False) -> None:
+        """Register again what BlueZ lost, once it offers its managers again."""
+        registered = self._registered
+        try:
+            if not listed:
+                await self._list()
+            await self._sync()
+        except ConnectionError as error:
+            log.warning("set-up cannot register its service with BlueZ again: %s", error)
+            return
+        if self._registered and not registered:
+            log.info("set-up's service is registered with BlueZ again")
+
+    async def _sync(self) -> None:
+        """Have BlueZ hold what the robot offers, as far as BlueZ offers its managers:
+        the service, then its advertisement."""
+        async with self._registering:
+            if self._advertised and not self._advertising:
+                self._advertised = False
+                await self._bluez_call(
+                    self.adapter_path,
+                    ADVERTISING_MANAGER,
+                    "UnregisterAdvertisement",
+                    "o",
+                    [ADVERTISEMENT_PATH],
+                )
+            if self._registered and not self._offered:
+                self._registered = False
+                await self._bluez_call(
+                    self.adapter_path, GATT_MANAGER, "UnregisterApplication", "o", [ROOT]
+                )
+            losses = self._losses
+            if self._offered and not self._registered and GATT_MANAGER in self._managers:
+                await self._bluez_call(
+                    self.adapter_path, GATT_MANAGER, "RegisterApplication", "oa{sv}", [ROOT, {}]
+                )
+                self._registered = self._losses == losses
+            if (
+                self._advertising
+                and self._registered
+                and not self._advertised
+                and ADVERTISING_MANAGER in self._managers
+            ):
+                await self._bluez_call(
+                    self.adapter_path,
+                    ADVERTISING_MANAGER,
+                    "RegisterAdvertisement",
+                    "oa{sv}",
+                    [ADVERTISEMENT_PATH, {}],
+                )
+                self._advertised = self._losses == losses
+
+    def _spawn(self, work: Coroutine[Any, Any, None]) -> None:
+        task = asyncio.get_running_loop().create_task(work)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
 
     def _acquire(self, request: Message) -> None:
         """Answer ``AcquireNotify``: an app enabled indications. It gets a channel of its
@@ -463,7 +586,7 @@ class BluezSetupLink(SetupLink):
         peer = options["device"].value if "device" in options else ""
         return peer if peer.startswith(self.adapter_path + "/") else None
 
-    async def _bluez(
+    async def _bluez_call(
         self, path: str, interface: str, member: str, signature: str = "", body: Sequence[Any] = ()
     ) -> list[Any]:
         assert self._bus is not None, "the link is not open"

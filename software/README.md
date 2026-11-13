@@ -109,6 +109,8 @@ On the Raspberry Pi, use `--profile pi` or set `AI_ROBOT_PROFILE=pi`. It keeps t
 
   BlueZ's D-Bus policy lets any user offer the set-up service. These are the policies of Debian Trixie's `network-manager` 1.52.1 and `bluez` 5.82 packages, and of Ubuntu 26.04's 1.54.3 and 5.85 (checked 2026-10-27), and systemd's own for timedated (checked 2026-10-28); the robot's image will carry its own rule ([ADR-0014](../docs/decisions/0014-updates.md)).
 
+  The robot follows BlueZ and NetworkManager on the bus, and acts only on the signals they sent. When `bluetoothd` restarts, as installing or upgrading `bluez` makes it do, set-up's apps are dropped, and the robot registers its service and advertisement again once BlueZ offers the controller's managers: it need not be restarted.
+
 On a Pi without its TPM, select the `file` identity in `config/local.toml` (see `local.example.toml`).
 
 `ai-robot --help` lists the options; `--duration SECONDS` stops the robot after a while, which is handy for quick checks. The environment variables are listed in [`.env.example`](.env.example).

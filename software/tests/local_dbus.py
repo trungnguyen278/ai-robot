@@ -14,6 +14,7 @@ import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -59,3 +60,28 @@ def private_bus(folder: Path) -> Iterator[str]:
         daemon.wait(START_SECONDS)
         if daemon.stdout is not None:
             daemon.stdout.close()
+
+
+async def impersonate(address: str, signal: Any) -> None:
+    """Send ``signal``, a dbus-fast ``Message``, from a connection of no service: what any
+    local program may do, on the system bus too, whose policy allows any signal (dbus 1.16,
+    bus/system.conf.in). One sent to a single connection reaches it whatever its match rules
+    (the D-Bus specification, Message Bus Specification). It returns once the recipient
+    has taken it: the bus keeps the order of one connection's messages to another, and the
+    recipient answers a ping after it."""
+    from dbus_fast import Message
+    from dbus_fast.aio import MessageBus
+
+    stranger = await MessageBus(bus_address=address).connect()
+    try:
+        await stranger.send(signal)
+        await stranger.call(
+            Message(
+                destination=signal.destination,
+                path="/",
+                interface="org.freedesktop.DBus.Peer",
+                member="Ping",
+            )
+        )
+    finally:
+        stranger.disconnect()

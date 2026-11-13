@@ -29,7 +29,7 @@ from ai_robot.core.jose import b64url, b64url_decode
 from ai_robot.core.spake2plus import ExchangeError, Prover, Verifier, record, stretch
 
 # Fixed by the protocol (platform/protocols/setup/README.md).
-PROTOCOL = "2.1"
+PROTOCOL = "2.2"
 CONTEXT_LABEL = b"ai-platform/setup/2"  # starts the context of the exchange
 KEYS_INFO = b"ai-platform/setup/2 keys"  # HKDF's info for the session keys
 KEY_BYTES = 16  # each side's AES-128-GCM key

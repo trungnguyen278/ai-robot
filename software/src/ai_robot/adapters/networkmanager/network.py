@@ -17,7 +17,7 @@ from typing import Any
 from dbus_fast import Message, MessageType, Variant
 from dbus_fast.aio import MessageBus
 
-from ai_robot.adapters.dbus import call, connect, watch
+from ai_robot.adapters.dbus import Owner, call, connect, watch
 from ai_robot.core.checks import positive
 from ai_robot.ports.network import (
     JoinError,
@@ -101,12 +101,15 @@ class NetworkManagerNetwork(Network):
         self.bus_address = bus
         self.scan_timeout = positive("scan_timeout", scan_timeout)
         self._bus: MessageBus | None = None
+        self._owner = Owner(NM)
         self._device = ""
         self._changes: asyncio.Queue[tuple[int, int]] = asyncio.Queue()  # (state, reason)
 
     async def open(self) -> None:
         self._bus = await connect(self.bus_address)
+        self._bus.add_message_handler(self._on_message)
         try:
+            await self._owner.follow(self._bus)
             (self._device,) = await self._call(
                 NM_PATH, NM, "GetDeviceByIpIface", "s", [self.interface]
             )
@@ -119,7 +122,6 @@ class NetworkManagerNetwork(Network):
             self._bus.disconnect()
             self._bus = None
             raise
-        self._bus.add_message_handler(self._on_message)
 
     async def close(self) -> None:
         if self._bus is not None:
@@ -278,6 +280,10 @@ class NetworkManagerNetwork(Network):
             self._changes.get_nowait()
 
     def _on_message(self, message: Message) -> None:
+        """NetworkManager says the device's state changed. Only its own signals count, as
+        the bus says who sent each (``Owner``)."""
+        if self._owner.changed(message) or not self._owner.sent(message):
+            return
         if (
             message.message_type is MessageType.SIGNAL
             and message.interface == DEVICE
