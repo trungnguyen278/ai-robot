@@ -102,7 +102,7 @@ def test_the_robots_hello_gives_its_discriminator_and_the_salt(secret: Secret) -
         "type": "hello",
         "seq": 1,
         "reply_to": 1,
-        "protocol": "2.1",
+        "protocol": "2.2",
         "discriminator": DISCRIMINATOR,
         "salt": b64url(secret.salt),
     }
@@ -132,7 +132,7 @@ def test_another_major_version_is_refused(secret: Secret) -> None:
 
 def test_a_newer_minor_version_is_welcome(secret: Secret) -> None:
     hello, _ = robot(secret).receive(AppSession(secret.code).hello(protocol="2.7"))
-    assert hello is not None and json.loads(hello)["protocol"] == "2.1"
+    assert hello is not None and json.loads(hello)["protocol"] == "2.2"
 
 
 @pytest.mark.parametrize(

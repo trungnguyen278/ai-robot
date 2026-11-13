@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 import waiting
-from local_dbus import private_bus
+from local_dbus import impersonate, private_bus
 
 from ai_robot.ports.setup import Connected, Disconnected, LinkEvent, Received
 
@@ -424,6 +424,322 @@ def test_a_refusal_from_bluez_is_an_error(bus: str) -> None:
         finally:
             await link.close()
             await bluez.stop()
+
+    asyncio.run(main())
+
+
+# ---- BlueZ that stops, starts, and loses its controller ----
+
+
+def test_bluez_that_restarts_ends_its_apps_and_takes_the_service_again(bus: str) -> None:
+    async def main() -> None:
+        async with started(bus) as (bluez, link):
+            await connect(bluez, link, PHONE)
+            bluez.registrations.clear()
+            await bluez.stop()  # as installing a bluez package does
+            assert await next_event(link) == Disconnected(PHONE)
+            assert not link.acquired
+            await bluez.start()  # a new connection, which knows nothing of before
+            await until(lambda: bluez.advertisement is not None)
+            assert bluez.advertisement["LocalName"] == "Robot"
+            assert bluez.registrations == ["application", "advertisement"]
+            await connect(bluez, link, PHONE)  # set-up goes on
+            await link.send(PHONE, b"info")
+            assert await bluez.receive(PHONE, TIMEOUT) == b"info"
+
+    asyncio.run(main(), debug=True)
+
+
+def test_what_the_robot_asks_while_bluez_is_away_holds_once_it_is_back(bus: str) -> None:
+    async def main() -> None:
+        async with started(bus) as (bluez, link):
+            await bluez.stop()
+            await until(lambda: link._bluez.unique is None)  # the link has heard it
+            await link.advertise(False)  # no error: there is nothing to unregister
+            bluez.registrations.clear()
+            await bluez.start()
+            await until(lambda: bluez.application)
+            await link.advertise(False)  # once the link has registered again
+            assert bluez.registrations == ["application"]
+            await link.advertise(True)
+            assert bluez.registrations == ["application", "advertisement"]
+            await bluez.stop()
+            await until(lambda: link._bluez.unique is None)
+            await link.stop()
+            await bluez.start()
+            await link.advertise(True)  # not offered: nothing
+            assert bluez.registrations == ["application", "advertisement"]
+
+    asyncio.run(main())
+
+
+def test_a_controller_that_goes_away_and_comes_back(
+    bus: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    from fake_bluez import ADVERTISING_MANAGER, GATT_MANAGER, MANAGERS
+
+    async def main() -> None:
+        async with started(bus) as (bluez, link):
+            await connect(bluez, link, PHONE)
+            bluez.registrations.clear()
+            bluez.remove(*MANAGERS)
+            assert await next_event(link) == Disconnected(PHONE)
+            bluez.add("org.bluez.Adapter1", GATT_MANAGER)
+            await until(lambda: bluez.application)
+            bluez.add(ADVERTISING_MANAGER)  # once the controller told its features
+            await until(lambda: bluez.advertisement is not None)
+            assert bluez.registrations == ["application", "advertisement"]
+            bluez.remove(ADVERTISING_MANAGER)
+            bluez.add(ADVERTISING_MANAGER)
+            await until(lambda: len(bluez.registrations) == 3)
+            assert bluez.registrations[2] == "advertisement"
+            bluez.remove(*MANAGERS)
+            bluez.add("org.bluez.Adapter1", GATT_MANAGER)
+            bluez.add(ADVERTISING_MANAGER)  # at once: two restorations meet
+            await until(lambda: len(bluez.registrations) == 5)
+            assert bluez.registrations[3:] == ["application", "advertisement"]
+        assert "cannot register" not in caplog.text
+
+    asyncio.run(main())
+
+
+def test_another_controller_that_goes_changes_nothing(bus: str) -> None:
+    from dbus_fast import Message
+    from fake_bluez import MANAGERS, OBJECT_MANAGER
+
+    async def main() -> None:
+        async with started(bus) as (bluez, link):
+            bluez.registrations.clear()
+            removed = ["/org/bluez/hci1", list(MANAGERS)]
+            bluez.bus.send(
+                Message.new_signal("/", OBJECT_MANAGER, "InterfacesRemoved", "oas", removed)
+            )
+            ping = Message(
+                destination=link._bus.unique_name,
+                path="/",
+                interface="org.freedesktop.DBus.Peer",
+                member="Ping",
+            )
+            await bluez.bus.call(ping)  # the link has taken the signal, sent before
+            await link.advertise(False)
+            assert bluez.registrations == ["-advertisement"]
+
+    asyncio.run(main())
+
+
+def test_starting_needs_bluez_and_its_managers(bus: str) -> None:
+    from fake_bluez import ADVERTISING_MANAGER, GATT_MANAGER, FakeBluez
+
+    from ai_robot.adapters.bluez.setup import BluezSetupLink
+
+    async def start(link: object) -> None:
+        """Start ``link`` once it has heard that BlueZ offers what it needs."""
+        async with asyncio.timeout(TIMEOUT):
+            while True:
+                with contextlib.suppress(ConnectionError):
+                    return await link.start("Robot")  # type: ignore[attr-defined]
+                await asyncio.sleep(0.01)
+
+    async def main() -> None:
+        link = BluezSetupLink(adapter="hci0", bus=bus, confirm_timeout=TIMEOUT)
+        await link.open()  # before BlueZ runs
+        bluez = FakeBluez(bus)
+        try:
+            with pytest.raises(ConnectionError, match="no GATT service and advertising"):
+                await link.start("Robot")
+            await bluez.start(offers=("org.bluez.Adapter1", GATT_MANAGER))
+            await asyncio.sleep(0.1)
+            with pytest.raises(ConnectionError, match="no GATT service and advertising"):
+                await link.start("Robot")
+            assert bluez.registrations == []
+            bluez.add(ADVERTISING_MANAGER)
+            await start(link)
+            assert bluez.registrations == ["application", "advertisement"]
+        finally:
+            await link.close()
+            await bluez.stop()
+
+    asyncio.run(main())
+
+
+def test_a_start_that_fails_leaves_nothing_registered(bus: str) -> None:
+    async def main() -> None:
+        async with started(bus) as (bluez, link):
+            await link.stop()
+            bluez.registrations.clear()
+            bluez.refuse_advertisement = True
+            with pytest.raises(ConnectionError, match="RegisterAdvertisement failed"):
+                await link.start("Robot")
+            assert bluez.registrations == ["application", "-application"]
+            await bluez.stop()
+            await bluez.start()  # BlueZ that restarts: nothing to register again
+            await link.advertise(True)
+            assert bluez.registrations == ["application", "-application"]
+
+    asyncio.run(main())
+
+
+def test_a_listing_older_than_a_change_is_taken_again(bus: str) -> None:
+    from fake_bluez import ADVERTISING_MANAGER, GATT_MANAGER, FakeBluez
+
+    from ai_robot.adapters.bluez.setup import BluezSetupLink
+
+    async def main() -> None:
+        bluez = FakeBluez(bus)
+        await bluez.start(offers=("org.bluez.Adapter1", GATT_MANAGER))
+        bluez.late = {ADVERTISING_MANAGER}  # comes as BlueZ lists, after its listing
+        link = BluezSetupLink(adapter="hci0", bus=bus, confirm_timeout=TIMEOUT)
+        await link.open()
+        try:
+            await link.start("Robot")
+            assert bluez.advertisement is not None
+        finally:
+            await link.close()
+            await bluez.stop()
+
+    asyncio.run(main())
+
+
+def test_a_listing_from_a_bluez_that_stopped_is_not_taken(bus: str) -> None:
+    from dbus_fast import Message
+    from fake_bluez import ADAPTER, BLUEZ, FakeBluez
+
+    from ai_robot.adapters.bluez.setup import BluezSetupLink
+
+    async def main() -> None:
+        bluez = FakeBluez(bus)
+        await bluez.start()
+        bluez.hold = True
+        link = BluezSetupLink(adapter="hci0", bus=bus, confirm_timeout=TIMEOUT)
+        opening = asyncio.create_task(link.open())
+        try:
+            await until(lambda: bluez.held)
+            await bluez.bus.release_name(BLUEZ)  # BlueZ stops as it answers
+            objects = {ADAPTER: {name: {} for name in bluez.managers}}
+            bluez.bus.send(Message.new_method_return(bluez.held[0], "a{oa{sa{sv}}}", [objects]))
+            await opening
+            with pytest.raises(ConnectionError, match="offers no"):
+                await link.start("Robot")
+        finally:
+            await link.close()
+            await bluez.stop()
+
+    asyncio.run(main())
+
+
+def test_a_registration_bluez_loses_as_it_answers_is_made_again(bus: str) -> None:
+    from fake_bluez import MANAGERS
+
+    async def main() -> None:
+        async with started(bus) as (bluez, link):
+            await link.stop()
+            bluez.registrations.clear()
+            bluez.vanish = MANAGERS  # the controller goes away as BlueZ registers
+            await link.start("Robot")
+            assert bluez.application == {} and bluez.advertisement is None
+            bluez.add(*MANAGERS)
+            await until(lambda: bluez.advertisement is not None)
+            assert bluez.registrations == ["application", "advertisement"]
+
+    asyncio.run(main())
+
+
+def test_an_advertisement_bluez_loses_as_it_answers_is_made_again(bus: str) -> None:
+    from fake_bluez import ADVERTISING_MANAGER
+
+    async def main() -> None:
+        async with started(bus) as (bluez, link):
+            await link.advertise(False)
+            bluez.registrations.clear()
+            bluez.vanish = (ADVERTISING_MANAGER,)
+            await link.advertise(True)
+            assert bluez.advertisement is None
+            bluez.add(ADVERTISING_MANAGER)
+            await until(lambda: bluez.advertisement is not None)
+            assert bluez.registrations == ["advertisement"]
+
+    asyncio.run(main())
+
+
+def test_another_interface_that_goes_takes_no_registration(bus: str) -> None:
+    async def main() -> None:
+        async with started(bus) as (bluez, link):
+            await link.stop()
+            bluez.registrations.clear()
+            bluez.vanish = ("org.bluez.Media1",)  # as BlueZ registers the service
+            await link.start("Robot")
+            assert bluez.registrations == ["application", "advertisement"]
+
+    asyncio.run(main())
+
+
+def test_closing_ends_what_bluez_started(bus: str) -> None:
+    from fake_bluez import FakeBluez
+
+    from ai_robot.adapters.bluez.setup import BluezSetupLink
+
+    async def main() -> None:
+        bluez = FakeBluez(bus)
+        await bluez.start()
+        link = BluezSetupLink(adapter="hci0", bus=bus, confirm_timeout=TIMEOUT)
+        await link.open()
+        await link.start("Robot")
+        await bluez.stop()
+        bluez.hold = True  # BlueZ does not answer the link's listing
+        await bluez.start(offers=())
+        await until(lambda: bluez.held)
+        await asyncio.wait_for(link.close(), TIMEOUT)
+        assert asyncio.all_tasks() == {asyncio.current_task()}
+        await bluez.stop()
+
+    asyncio.run(main())
+
+
+# ---- only BlueZ, and the bus, are heard ----
+
+
+def test_only_bluez_and_the_bus_are_heard(bus: str) -> None:
+    """Another program's signals, sent to the robot alone, change nothing."""
+    from dbus_fast import Message, Variant
+    from fake_bluez import MANAGERS
+
+    async def main() -> None:
+        async with started(bus) as (bluez, link):
+            await connect(bluez, link, PHONE)
+            bluez.registrations.clear()
+            signals = [
+                Message.new_signal(
+                    PHONE,
+                    PROPERTIES,
+                    "PropertiesChanged",
+                    "sa{sv}as",
+                    ["org.bluez.Device1", {"Connected": Variant("b", False)}, []],
+                ),
+                Message.new_signal(
+                    "/",
+                    "org.freedesktop.DBus.ObjectManager",
+                    "InterfacesRemoved",
+                    "oas",
+                    ["/org/bluez/hci0", list(MANAGERS)],
+                ),
+                Message.new_signal(
+                    "/org/freedesktop/DBus",
+                    "org.freedesktop.DBus",
+                    "NameOwnerChanged",
+                    "sss",
+                    ["org.bluez", bluez.bus.unique_name, ""],
+                ),
+            ]
+            for signal in signals:
+                signal.destination = link._bus.unique_name
+                await impersonate(bus, signal)
+            with pytest.raises(TimeoutError):
+                await next_event(link, 0.1)
+            assert link.acquired
+            await link.send(PHONE, b"info")
+            assert await bluez.receive(PHONE, TIMEOUT) == b"info"
+            await link.advertise(False)
+            assert bluez.registrations == ["-advertisement"]  # it was still registered
 
     asyncio.run(main())
 
