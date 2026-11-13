@@ -49,6 +49,7 @@ A failing check is a finding; fix it before reading further.
 - Each concern lives with its owner (power with `system`, what is shown with `screen`); a module does not grow change detectors for another module's data.
 - Messages are frozen dataclasses; mutable fields are deep, read-only copies; checks use `core/checks.py`.
 - Hardware values come from the configuration, with no defaults in code.
+- A file descriptor has one owner, and every path closes it. One passed over D-Bus is closed once the message has gone: dbus-fast keeps no copy, and only a bus made with `negotiate_unix_fd=True` passes it at all. A socket the event loop reads or writes (`add_reader`, `sock_sendall`) is non-blocking, which asyncio's debug mode checks. A test counts the open descriptors (`/proc/self/fd`).
 
 ### Renderer (`ui/src/`)
 

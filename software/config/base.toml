@@ -229,7 +229,7 @@ adapter = "sim"
 [ports.setup_link.bluez]
 adapter = "hci0"  # the Bluetooth controller: the Pi's own
 bus = "system"  # the D-Bus BlueZ is on; tests give another bus's address
-confirm_timeout = 5.0  # seconds an app has to confirm a fragment, before it is dropped
+confirm_timeout = 5.0  # seconds an app has to enable indications and confirm a fragment, or be dropped
 
 # The robot's Wi-Fi: the networks it sees and joins. "sim" sees the networks below, which
 # take any password.
