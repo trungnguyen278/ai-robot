@@ -27,3 +27,4 @@ Each significant decision is a short file: context, decision, alternatives consi
 | [0017](0017-ros-2.md) | ROS 2 on the robot: every module a node, the body through ros2_control, on Ubuntu | Accepted | 2026-10-27 |
 | [0018](0018-conversations.md) | Conversations on the robot: one wake word, many turns | Accepted | 2026-10-28 |
 | [0019](0019-setup-button.md) | Set-up without the touch screen: hold the microphones' mute button | Accepted | 2026-10-29 |
+| [0020](0020-patched-bluez.md) | BlueZ: Ubuntu's package with upstream's fix, until Ubuntu ships it | Accepted | 2026-11-13 |
