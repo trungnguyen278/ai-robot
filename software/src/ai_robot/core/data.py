@@ -9,6 +9,7 @@ made, so that a bad value fails at its publisher rather than inside another modu
 from __future__ import annotations
 
 import json
+import math
 import re
 from collections.abc import Iterator, Mapping
 from types import MappingProxyType
@@ -44,6 +45,66 @@ def encode(value: Any) -> str:
 def plain(value: Any) -> Any:
     """``value`` with read-only mappings and tuples turned back into dicts and lists."""
     return json.loads(encode(value))
+
+
+# Fixed by ai-platform's ADR-0014, for every protocol it holds: arrays and objects nest at
+# most this deep, the outermost counted.
+JSON_DEPTH = 64
+
+# What nests in a JSON text, found past its strings: a string, or a bracket.
+_NESTING = re.compile(r'"[^"\\]*(?:\\.[^"\\]*)*"|[\[\]{}]')
+# What no side can hold in a name or a string (ADR-0014): U+0000, and a lone surrogate,
+# which UTF-8 cannot encode. ``json`` joins an escaped pair into the code point it spells.
+_UNHOLDABLE = re.compile(r"[\x00\ud800-\udfff]")
+
+
+def read_json(text: str | bytes) -> Any:
+    """``text``, UTF-8 if it is bytes, as JSON that every side can hold (ai-platform's
+    ADR-0014): ``ValueError`` for a text that is not JSON, NaN and Infinity included, that
+    nests deeper than ``JSON_DEPTH``, that holds a U+0000 or a lone surrogate, or a number
+    past a double. The nesting is counted before the text is parsed, so that the answer
+    depends on the text, not on where the parser gives up. The error names the rule
+    broken, never the text."""
+    if isinstance(text, bytes):
+        try:
+            text = text.decode("utf-8")
+        except UnicodeDecodeError:
+            raise ValueError("the text is not UTF-8") from None
+    depth = 0
+    for token in _NESTING.finditer(text):
+        bracket = token.group()
+        if bracket in ("[", "{"):
+            depth += 1
+            if depth > JSON_DEPTH:
+                raise ValueError(f"the text nests deeper than {JSON_DEPTH}")
+        elif bracket in ("]", "}"):
+            depth -= 1
+    try:
+        value = json.loads(text, parse_constant=_no_constant, parse_float=_double)
+    except json.JSONDecodeError:
+        raise ValueError("the text is not JSON") from None
+    pending = [value]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, dict):
+            pending.extend(item.values())
+            pending.extend(item.keys())
+        elif isinstance(item, list):
+            pending.extend(item)
+        elif isinstance(item, str) and _UNHOLDABLE.search(item):
+            raise ValueError("the text holds a U+0000 or a lone surrogate")
+    return value
+
+
+def _no_constant(name: str) -> Any:
+    raise ValueError(f"{name} is not JSON")
+
+
+def _double(literal: str) -> float:
+    number = float(literal)
+    if not math.isfinite(number):
+        raise ValueError("a number is past a double")
+    return number
 
 
 def _thaw(value: Any) -> Any:

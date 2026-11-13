@@ -48,6 +48,7 @@ from ai_robot.modules.settings import SettingsModule
 from ai_robot.modules.setup import LINK_LENGTH, SCENE, SetupModule
 from ai_robot.modules.system import SystemModule
 from ai_robot.ports import Binding
+from ai_robot.ports.setup import LinkEvent
 
 TIMEOUT = 5.0
 M = TypeVar("M", bound=Message)
@@ -74,10 +75,15 @@ SETTINGS: dict[str, Any] = {
 class Robot:
     """The module, its ports and the bus, and the cloud's part of set-up."""
 
-    def __init__(self, **settings: Any) -> None:
+    def __init__(
+        self,
+        networks: list[dict[str, Any]] = NETWORKS,
+        link: SimSetupLink | None = None,
+        **settings: Any,
+    ) -> None:
         self.bus = Bus()
-        self.link = SimSetupLink()
-        self.network = SimNetwork(networks=NETWORKS)
+        self.link = link or SimSetupLink()
+        self.network = SimNetwork(networks=networks)
         ctx = ModuleContext(
             name="setup",
             bus=self.bus,
@@ -187,6 +193,15 @@ class App:
     async def ask(self, session: AppSession, kind: str, **fields: Any) -> dict[str, Any]:
         self.link.deliver(self.peer, session.request(kind, **fields))
         return session.read(await self.receive())
+
+    async def refused(self, first: bytes) -> dict[str, Any]:
+        """Send ``first``, and read the error the robot answers before it drops this app."""
+        self.link.deliver(self.peer, first)
+        error: dict[str, Any] = json.loads(await self.receive())
+        await self.gone()
+        with pytest.raises(ConnectionError):  # nothing came after the error
+            await self.receive()
+        return error
 
     async def gone(self) -> None:
         """Wait until the robot dropped this app."""
@@ -362,12 +377,119 @@ def test_one_app_at_a_time() -> None:
         first, second = App(robot, "first"), App(robot, "second")
         async with running(robot):
             robot.bind(False)
-            await first.open((await robot.code_shown())["code"])
+            code = (await robot.code_shown())["code"]
+            session = await first.open(code)
             second.connect()
-            refusal = json.loads(await second.receive())
-            assert (refusal["type"], refusal["code"]) == ("error", "busy")
-            await second.gone()
-            assert robot.link.connected("first")
+            busy = await second.refused(AppSession(code).hello())  # its first message is busy
+            assert busy == {
+                "type": "error",
+                "seq": 1,
+                "reply_to": 1,
+                "code": "busy",
+                "message": busy["message"],
+            }
+            # The first app heard nothing of it, and its session goes on.
+            assert (await first.ask(session, "info"))["type"] == "info"
+            assert robot.link.connected("first") and not robot.link.advertised
+
+    asyncio.run(main())
+
+
+def test_the_session_is_the_first_hellos() -> None:
+    async def main() -> None:
+        robot = Robot()
+        early, late = App(robot, "early"), App(robot, "late")
+        async with running(robot):
+            robot.bind(False)
+            code = (await robot.code_shown())["code"]
+            early.connect()  # connects first, but says hello second
+            session = await late.open(code)
+            assert (await robot.scene()) == {"state": "connected"}
+            busy = await early.refused(AppSession(code).hello())
+            assert (busy["code"], busy["reply_to"]) == ("busy", 1)
+            assert (await late.ask(session, "finish"))["type"] == "finished"
+
+    asyncio.run(main())
+
+
+@pytest.mark.parametrize(
+    ("first", "reply_to"),
+    [
+        (json.dumps({"type": "info", "seq": 1}).encode(), 1),  # not a hello
+        (b"not json", None),
+    ],
+)
+def test_a_second_app_that_does_not_say_hello_is_refused(
+    first: bytes, reply_to: int | None
+) -> None:
+    async def main() -> None:
+        robot = Robot()
+        app, other = App(robot), App(robot, "other")
+        async with running(robot):
+            robot.bind(False)
+            session = await app.open((await robot.code_shown())["code"])
+            other.connect()
+            error = await other.refused(first)
+            assert (error["code"], error["seq"], error.get("reply_to")) == (
+                "protocol",
+                1,
+                reply_to,
+            )
+            assert (await app.ask(session, "info"))["type"] == "info"
+
+    asyncio.run(main())
+
+
+def test_an_app_that_connects_once_set_up_has_closed_gets_no_message() -> None:
+    async def main() -> None:
+        robot = Robot()
+        app = App(robot)
+        async with running(robot):
+            robot.bind(True)
+            assert await robot.scene() is None
+            robot.link.offered = True  # it connected as set-up closed
+            app.connect()
+            # Its first write may hold a whole message: the robot ignores it.
+            app.link.deliver(app.peer, AppSession("00000000").hello())
+            await app.gone()
+            with pytest.raises(ConnectionError):
+                await app.receive()
+            robot.link.offered = False
+            robot.bind(False)  # and set-up still opens
+            session = await app.open((await robot.code_shown())["code"])
+            assert (await app.ask(session, "info"))["type"] == "info"
+
+    asyncio.run(main())
+
+
+def test_an_app_that_leaves_and_comes_back_is_served() -> None:
+    async def main() -> None:
+        robot = Robot()
+        app = App(robot)
+        async with running(robot):
+            robot.bind(False)
+            code = (await robot.code_shown())["code"]
+            app.connect()
+            app.link.disconnect(app.peer)  # gone before its first message
+            session = await app.open(code)
+            assert (await app.ask(session, "info"))["type"] == "info"
+            app.link.disconnect(app.peer)
+            for _ in range(100):
+                if not robot.module._inboxes:
+                    break
+                await asyncio.sleep(0.01)
+            assert not robot.module._inboxes  # nothing is kept of an app that left
+
+    asyncio.run(main())
+
+
+def test_an_app_connects_once_until_it_leaves() -> None:
+    async def main() -> None:
+        link = SimSetupLink()
+        await link.start("robot")
+        link.connect("app")
+        with pytest.raises(ConnectionError):  # as a radio connects a device once
+            link.connect("app")
 
     asyncio.run(main())
 
@@ -383,6 +505,66 @@ def test_what_the_robot_sent_before_dropping_an_app_can_still_be_read() -> None:
         assert await link.receive("app") == b"busy"
         with pytest.raises(ConnectionError):
             await link.receive("app")
+
+    asyncio.run(main())
+
+
+class StuckLink(SimSetupLink):
+    """A link that cannot stop offering the service, as when the Bluetooth adapter stops
+    answering: the apps connected stay connected. It keeps the events the robot took."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.taken: list[LinkEvent] = []
+
+    async def stop(self) -> None:
+        raise ConnectionError("the adapter does not answer")
+
+    async def event(self) -> LinkEvent:
+        event = await super().event()
+        self.taken.append(event)
+        return event
+
+
+def test_an_app_whose_hello_comes_once_set_up_has_closed_gets_no_message() -> None:
+    async def main() -> None:
+        link = StuckLink()
+        robot = Robot(link=link)
+        app = App(robot)
+        async with running(robot):
+            robot.bind(False)
+            code = (await robot.code_shown())["code"]
+            app.connect()
+            for _ in range(100):  # until the robot took the connection, set-up open
+                if link.taken:
+                    break
+                await asyncio.sleep(0.01)
+            robot.bind(True)
+            await robot.until(None)
+            app.link.deliver(app.peer, AppSession(code).hello())
+            await app.gone()
+            with pytest.raises(ConnectionError):
+                await app.receive()
+
+    asyncio.run(main())
+
+
+def test_networks_without_a_name_are_left_out_and_names_with_a_nul_go_in_hex() -> None:
+    nul = chr(0)
+    hidden = [nul * 4, " ", nul]  # as hostapd and NetworkManager hide a network
+    networks = [{"ssid": name, "security": "wpa2", "signal": 50} for name in hidden]
+    networks.append({"ssid": f"A{nul}B", "security": "open", "signal": 40})
+    networks.append({"ssid": "  ", "security": "open", "signal": 30})  # two spaces: a name
+
+    async def main() -> None:
+        robot = Robot(networks=networks)
+        app = App(robot)
+        async with running(robot):
+            robot.bind(False)
+            session = await app.open((await robot.code_shown())["code"])
+            found = (await app.ask(session, "networks"))["networks"]
+            assert [n.get("ssid", n.get("ssid_hex")) for n in found] == ["410042", "  "]
+            assert "ssid" not in found[0]
 
     asyncio.run(main())
 

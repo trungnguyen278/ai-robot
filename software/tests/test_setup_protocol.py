@@ -11,7 +11,7 @@ import jwt
 import pytest
 
 from ai_robot.core.config import platform_dir
-from ai_robot.core.data import Schema
+from ai_robot.core.data import Schema, read_json
 from ai_robot.core.jose import b64url, b64url_decode
 from ai_robot.core.setup_session import Records, _context, _session_keys
 from ai_robot.core.spake2plus import Prover, Verifier, decode, record, stretch
@@ -30,11 +30,16 @@ def schema(side: str) -> Schema:
 
 
 EXAMPLE = load("examples/session.json")
+EXAMPLES = sorted(path.name for path in (PROTOCOL / "examples").glob("*.json"))
 
 
-def test_every_message_of_the_example_follows_the_schema() -> None:
+@pytest.mark.parametrize("name", EXAMPLES)
+def test_every_message_of_the_examples_follows_the_schema(name: str) -> None:
     schemas = {"app": schema("app"), "device": schema("device")}
-    for step in EXAMPLE["messages"]:
+    example = read_json((PROTOCOL / "examples" / name).read_bytes())  # as every side holds it
+    steps = [step for step in example["messages"] if "message" in step]  # not the notes
+    assert steps
+    for step in steps:
         assert schemas[step["from"]].problem(step["message"]) is None, step
 
 

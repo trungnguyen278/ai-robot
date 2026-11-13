@@ -55,6 +55,8 @@ class SimSetupLink(SetupLink):
         """``peer`` connects, as an app would while the service is offered."""
         if not self.offered:
             raise ConnectionError("the set-up service is not offered")
+        if peer in self._peers:
+            raise ConnectionError(f"{peer} is connected already")
         self._peers.add(peer)
         self._outboxes[peer] = asyncio.Queue()
         self._events.put_nowait(Connected(peer))

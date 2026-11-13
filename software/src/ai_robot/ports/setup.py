@@ -12,7 +12,8 @@ from ai_robot.ports.base import Port
 
 @dataclass(frozen=True, slots=True)
 class Connected:
-    """An app connected. ``peer`` names it, as the adapter knows it."""
+    """An app connected. ``peer`` names it, as the adapter knows it: a peer connects
+    again only after its ``Disconnected``."""
 
     peer: str
 

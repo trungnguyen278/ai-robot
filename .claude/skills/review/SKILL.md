@@ -36,6 +36,10 @@ A failing check is a finding; fix it before reading further.
 - Data is plain JSON: finite numbers only (JSON has no NaN), string keys, no dates or other objects. It is checked where it is made (`ports.screen.scene_data`, `core/checks.py`), not when it is sent; a bad value must fail at the publisher, never stop the robot from inside another module.
 - What does a page get on its first connection, before any state, and after a reconnect? Old pages and unknown fields are handled.
 - Schemas are checked through `core/data.py`'s `Schema`, never a bare validator: Python's `$` also matches before a last newline, which JSON Schema's, ECMA-262's, does not, and jsonschema's messages quote the value. A problem is logged and sent, so it names where and the rule broken, never the value, which may be a password or a token.
+- JSON from another side is read with `core/data.py`'s `read_json`, never a bare `json.loads`, which takes NaN, a lone surrogate, a U+0000 and any nesting that its stack allows (ai-platform's ADR-0014). Text the robot sends holds no U+0000 either: a network name with a NUL byte goes as `ssid_hex`.
+- An error replies to the message it answers whenever that message's `seq` can be read, in a handshake too; only an unreadable message's error has no `reply_to`.
+- To whom a message goes: a link that serves several peers sends each answer to its own peer only. A characteristic's `Value` reaches every subscriber; check what the transport does, not only what the port says.
+- What a receiver holds is bounded by what was announced, before it appends: count bytes, not fragments, and let an empty fragment cost nothing. Fragments also fit the longest attribute value, 512 bytes, at any MTU.
 
 ### Python modules (`software/src/ai_robot/`)
 
