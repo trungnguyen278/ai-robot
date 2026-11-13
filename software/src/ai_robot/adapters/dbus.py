@@ -14,12 +14,12 @@ BUS_NAME = "org.freedesktop.DBus"  # the bus itself (the D-Bus specification)
 BUS_PATH = "/org/freedesktop/DBus"
 
 
-async def connect(address: str) -> MessageBus:
+async def connect(address: str, *, unix_fds: bool = False) -> MessageBus:
     """A connection to the bus at ``address``: ``system``, or another bus's address, as
-    the tests use."""
+    the tests use. ``unix_fds`` lets it pass file descriptors."""
     if address == "system":
-        return await MessageBus(bus_type=BusType.SYSTEM).connect()
-    return await MessageBus(bus_address=address).connect()
+        return await MessageBus(bus_type=BusType.SYSTEM, negotiate_unix_fd=unix_fds).connect()
+    return await MessageBus(bus_address=address, negotiate_unix_fd=unix_fds).connect()
 
 
 async def call(

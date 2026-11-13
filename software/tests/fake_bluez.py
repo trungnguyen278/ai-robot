@@ -1,11 +1,22 @@
 # SPDX-License-Identifier: MIT
-"""BlueZ, as the set-up link's tests need it (doc/org.bluez.*.rst in BlueZ's sources): on a
-private D-Bus, a controller that takes the robot's GATT application and advertisement,
-and phones that connect, write fragments and confirm indications, as BlueZ relays them."""
+"""BlueZ, as the set-up link's tests need it (BlueZ 5.85, doc/org.bluez.*.rst and
+src/gatt-database.c): on a private D-Bus, a controller that takes the robot's GATT
+application and advertisement, and phones that connect, write fragments, and enable and
+confirm indications, as BlueZ relays them.
+
+A phone that enables indications has BlueZ call ``AcquireNotify``, which hands BlueZ one
+end of a socket pair: BlueZ indicates each packet read from it, of 512 bytes at most, to
+that phone, and writes one byte, 0x01, for each confirmation (``sock_io_read`` and
+``sock_io_write``). It closes its end when the phone disables indications or disconnects.
+"""
 
 from __future__ import annotations
 
 import asyncio
+import collections
+import contextlib
+import os
+import socket
 from typing import Any
 
 from dbus_fast import Message, MessageType, Variant
@@ -20,6 +31,10 @@ ADVERTISING_MANAGER = "org.bluez.LEAdvertisingManager1"
 DEVICE = "org.bluez.Device1"
 CHARACTERISTIC = "org.bluez.GattCharacteristic1"
 PROPERTIES = "org.freedesktop.DBus.Properties"
+ANSWER_UUID = "eaf35dcd-e774-4881-b0c6-4990127a1289"  # the protocol's Answer
+READ_BYTES = 512  # what BlueZ reads of a packet: its buffer in sock_io_read
+CONFIRMATION = bytes([1])  # what BlueZ writes for each confirmation (sock_io_write)
+DEFAULT_MTU = 23
 
 
 def plain(value: Any) -> Any:
@@ -39,7 +54,7 @@ class FakeBluez:
     ``application`` holds the robot's GATT objects once it registers them (path ->
     interface -> properties), and ``advertisement`` the properties of its advertisement
     while it advertises. ``refuse`` makes the next registration fail. Phones are named
-    by their device's object path.
+    by their device's object path; those in ``silent`` do not confirm indications.
     """
 
     def __init__(self, address: str) -> None:
@@ -50,12 +65,21 @@ class FakeBluez:
         self.robot = ""  # the robot's unique name on the bus
         self.disconnected: list[str] = []  # devices the robot asked to disconnect
         self.refuse = False
-        self.confirming = True  # whether phones confirm the indications they get
-        self.indications: asyncio.Queue[bytes] = asyncio.Queue()
+        self.refuse_all = False  # every call to the controller fails
+        self.silent: set[str] = set()
+        # Each phone's indications, and the channels the robot closed, in order.
+        self.indications: collections.defaultdict[str, asyncio.Queue[bytes]] = (
+            collections.defaultdict(asyncio.Queue)
+        )
+        self.closed: list[str] = []
+        self.acquired: list[bool] = []  # NotifyAcquired, each time the robot says it changed
+        self.errors: list[str] = []  # the errors the robot sent
+        self._channels: dict[str, socket.socket] = {}  # each phone's channel, BlueZ's end
+        self._shut: set[socket.socket] = set()  # the ends BlueZ shut down
         self._tasks: set[asyncio.Task[None]] = set()
 
     async def start(self) -> None:
-        self.bus = await MessageBus(bus_address=self.address).connect()
+        self.bus = await MessageBus(bus_address=self.address, negotiate_unix_fd=True).connect()
         await self.bus.request_name(BLUEZ)
         self.bus.add_message_handler(self._handle)
 
@@ -68,15 +92,20 @@ class FakeBluez:
     # ---- what the robot asks of BlueZ ----
 
     def _handle(self, message: Message) -> bool | None:
+        if message.message_type is MessageType.ERROR:
+            self.errors.append(message.error_name or "")
+            return None
         if message.message_type is MessageType.SIGNAL and message.member == "PropertiesChanged":
             interface, changed, _ = message.body
-            if interface == CHARACTERISTIC and "Value" in changed:
-                self._spawn(self._indicated(message.path, bytes(changed["Value"].value)))
+            if interface == CHARACTERISTIC and "NotifyAcquired" in changed:
+                self.acquired.append(changed["NotifyAcquired"].value)
             return None
         if message.message_type is not MessageType.METHOD_CALL:
             return None
         call = (message.interface, message.member)
-        if call == (GATT_MANAGER, "RegisterApplication"):
+        if self.refuse_all and message.path.startswith(ADAPTER):
+            self._error(message, "org.bluez.Error.Failed", "refused for the test")
+        elif call == (GATT_MANAGER, "RegisterApplication"):
             self._spawn(self._register_application(message))
         elif call == (GATT_MANAGER, "UnregisterApplication"):
             self.application = {}
@@ -100,12 +129,14 @@ class FakeBluez:
             self._error(message, "org.bluez.Error.Failed", "refused for the test")
             return
         self.robot = message.sender
-        (objects,) = await self._call(
-            message.body[0], "org.freedesktop.DBus.ObjectManager", "GetManagedObjects", "", []
-        )
+        (objects,) = (
+            await self.call(
+                message.body[0], "org.freedesktop.DBus.ObjectManager", "GetManagedObjects", "", []
+            )
+        ).body
         self.application = plain(objects)
         self._reply(message)
-        await self._call(
+        await self.call(
             "/org/freedesktop/DBus",
             "org.freedesktop.DBus",
             "AddMatch",
@@ -115,14 +146,16 @@ class FakeBluez:
         )
 
     async def _register_advertisement(self, message: Message) -> None:
-        (properties,) = await self._call(
-            message.body[0],
-            PROPERTIES,
-            "GetAll",
-            "s",
-            ["org.bluez.LEAdvertisement1"],
-            destination=message.sender,
-        )
+        (properties,) = (
+            await self.call(
+                message.body[0],
+                PROPERTIES,
+                "GetAll",
+                "s",
+                ["org.bluez.LEAdvertisement1"],
+                destination=message.sender,
+            )
+        ).body
         self.advertisement = plain(properties)
         self._reply(message)
 
@@ -135,12 +168,44 @@ class FakeBluez:
                 return path
         raise KeyError(uuid)
 
-    async def subscribe(self, uuid: str) -> None:
-        """A phone enables the indications of characteristic ``uuid``."""
-        await self._call(self.characteristic(uuid), CHARACTERISTIC, "StartNotify", "", [])
+    async def subscribe(self, device: str, mtu: int = DEFAULT_MTU, *, again: bool = False) -> None:
+        """``device`` enables the answer's indications: BlueZ asks the robot for a channel,
+        with the options BlueZ gives (``append_options``). BlueZ asks again only once the
+        channel it holds has closed (``ccc_write_cb``), unless ``again``."""
+        assert again or device not in self._channels, "subscribed already"
+        reply = await self.call(
+            self.characteristic(ANSWER_UUID),
+            CHARACTERISTIC,
+            "AcquireNotify",
+            "a{sv}",
+            [
+                {
+                    "device": Variant("o", device),
+                    "link": Variant("s", "LE"),
+                    "mtu": Variant("q", mtu),
+                }
+            ],
+        )
+        index, given = reply.body
+        assert reply.signature == "hq" and given == mtu, reply.body
+        descriptor = reply.unix_fds[index]
+        assert not os.get_blocking(descriptor)  # as bluetoothctl makes it (client/gatt.c)
+        end = socket.socket(fileno=descriptor)
+        end.setblocking(False)  # as Python's socket takes it
+        assert end.type == socket.SOCK_SEQPACKET
+        self._channels[device] = end
+        self._spawn(self._relay(device, end))
+
+    def unsubscribe(self, device: str) -> None:
+        """``device`` disables the answer's indications: BlueZ shuts its end down at once
+        (``att_disconnect_cb``), and closes it."""
+        if (end := self._channels.pop(device, None)) is not None:
+            self._shut.add(end)
+            with contextlib.suppress(OSError):  # closed already
+                end.shutdown(socket.SHUT_RDWR)
 
     async def write(self, device: str, uuid: str, fragment: bytes, mtu: int) -> None:
-        await self._call(
+        await self.call(
             self.characteristic(uuid),
             CHARACTERISTIC,
             "WriteValue",
@@ -149,27 +214,23 @@ class FakeBluez:
         )
 
     async def send(self, device: str, uuid: str, message: bytes, mtu: int) -> None:
-        """A phone writes ``message``, in fragments, to characteristic ``uuid``."""
+        """``device`` writes ``message``, in fragments, to characteristic ``uuid``."""
         for fragment in split(message, mtu):
             await self.write(device, uuid, fragment, mtu)
 
-    async def receive(self, timeout: float) -> bytes:
-        """The next whole message the robot indicated."""
+    async def receive(self, device: str, timeout: float) -> bytes:
+        """The next whole message the robot indicated to ``device``."""
         joiner = Joiner()
         while True:
-            fragment = await asyncio.wait_for(self.indications.get(), timeout)
+            fragment = await asyncio.wait_for(self.indications[device].get(), timeout)
             message = joiner.add(fragment)
             if message is not None:
                 return message
 
-    async def _indicated(self, path: str, value: bytes) -> None:
-        self.indications.put_nowait(value)
-        if self.confirming:
-            await self._call(path, CHARACTERISTIC, "Confirm", "", [])
-
     def disconnect(self, device: str) -> None:
-        """BlueZ says that ``device`` disconnected."""
+        """``device`` disconnects: BlueZ closes its channel and says so."""
         assert self.bus is not None
+        self.unsubscribe(device)
         self.bus.send(
             Message.new_signal(
                 device,
@@ -179,6 +240,19 @@ class FakeBluez:
                 [DEVICE, {"Connected": Variant("b", False)}, []],
             )
         )
+
+    async def _relay(self, device: str, end: socket.socket) -> None:
+        """BlueZ's end of the channel of ``device``."""
+        loop = asyncio.get_running_loop()
+        with end, contextlib.suppress(OSError):
+            while packet := await loop.sock_recv(end, READ_BYTES):
+                self.indications[device].put_nowait(packet)
+                if device not in self.silent:
+                    await loop.sock_sendall(end, CONFIRMATION)
+        if end not in self._shut:  # the robot closed it
+            if self._channels.get(device) is end:
+                del self._channels[device]
+            self.closed.append(device)
 
     # ---- plumbing ----
 
@@ -195,7 +269,7 @@ class FakeBluez:
         assert self.bus is not None
         self.bus.send(Message.new_error(message, name, text))
 
-    async def _call(
+    async def call(
         self,
         path: str,
         interface: str,
@@ -203,7 +277,8 @@ class FakeBluez:
         signature: str,
         body: list[Any],
         destination: str | None = None,
-    ) -> list[Any]:
+    ) -> Message:
+        """Call the robot, or ``destination``; the reply. ``ConnectionError`` for an error."""
         assert self.bus is not None
         reply = await self.bus.call(
             Message(
@@ -218,4 +293,4 @@ class FakeBluez:
         assert reply is not None
         if reply.message_type is MessageType.ERROR:
             raise ConnectionError(f"{member}: {reply.error_name}: {reply.body}")
-        return list(reply.body)
+        return reply

@@ -3,8 +3,11 @@
 Bluetooth service): a GATT service and an advertisement, on D-Bus.
 
 BlueZ's GATT server calls this application over D-Bus: ``WriteValue`` for each fragment an
-app writes, ``StartNotify`` when it enables indications, ``Confirm`` when it confirms one.
-The robot sends a fragment by changing the answer's ``Value``, which BlueZ indicates.
+app writes, and ``AcquireNotify`` when an app enables indications. That call takes one end
+of a socket pair for that app alone: BlueZ indicates each packet the robot writes to the
+other end, to that app only, and writes one byte back for each confirmation. It closes its
+end when the app disables indications or disconnects (BlueZ 5.85,
+doc/org.bluez.GattCharacteristic.rst and src/gatt-database.c).
 """
 
 # No `from __future__ import annotations` here: dbus-fast reads the annotations of the
@@ -12,8 +15,11 @@ The robot sends a fragment by changing the answer's ``Value``, which BlueZ indic
 
 import asyncio
 import contextlib
+import functools
 import logging
-from collections.abc import Sequence
+import socket
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field
 from typing import Annotated, Any
 
 from dbus_fast import Message, MessageType, Variant
@@ -38,9 +44,15 @@ ANSWER_UUID = "eaf35dcd-e774-4881-b0c6-4990127a1289"
 BLUEZ = "org.bluez"
 GATT_MANAGER = "org.bluez.GattManager1"
 ADVERTISING_MANAGER = "org.bluez.LEAdvertisingManager1"
+CHARACTERISTIC = "org.bluez.GattCharacteristic1"
 DEVICE = "org.bluez.Device1"
 PROPERTIES = "org.freedesktop.DBus.Properties"
+# The error BlueZ takes as final when it asks for a channel: it then does not fall back on
+# StartNotify (acquire_notify_reply in src/gatt-database.c, BlueZ 5.85).
+FAILED = "org.bluez.Error.Failed"
 DEFAULT_MTU = 23  # the ATT MTU until a larger one is exchanged (Bluetooth Core, Vol 3, Part F)
+# BlueZ writes one byte, 0x01, for each confirmation (sock_io_write in src/gatt-database.c).
+CONFIRMATION_BYTES = 1
 # A legacy advertisement holds 31 bytes: the flags take 3 and the service's 128-bit UUID
 # 18, which leaves 8 for the name, after its 2 bytes of length and type.
 NAME_BYTES = 8
@@ -80,7 +92,7 @@ class _Request(ServiceInterface):
     """The characteristic apps write their fragments to."""
 
     def __init__(self, link: "BluezSetupLink") -> None:
-        super().__init__("org.bluez.GattCharacteristic1")
+        super().__init__(CHARACTERISTIC)
         self._link = link
 
     @dbus_property(access=PropertyAccess.READ, name="UUID")
@@ -101,12 +113,13 @@ class _Request(ServiceInterface):
 
 
 class _Answer(ServiceInterface):
-    """The characteristic the robot indicates its fragments on."""
+    """The characteristic the robot indicates its fragments on, through each app's channel.
+    The link answers ``AcquireNotify`` itself (``BluezSetupLink._acquire``), since it
+    hands over a file descriptor."""
 
     def __init__(self, link: "BluezSetupLink") -> None:
-        super().__init__("org.bluez.GattCharacteristic1")
+        super().__init__(CHARACTERISTIC)
         self._link = link
-        self.data = b""
 
     @dbus_property(access=PropertyAccess.READ, name="UUID")
     def uuid(self) -> DBusStr:
@@ -120,25 +133,10 @@ class _Answer(ServiceInterface):
     def flags(self) -> DBusStrings:
         return ["indicate"]
 
-    @dbus_property(access=PropertyAccess.READ, name="Value")
-    def value(self) -> DBusBytes:
-        return self.data
-
-    @dbus_method(name="StartNotify")
-    def start_notify(self) -> None:
-        self._link.notifying = True
-
-    @dbus_method(name="StopNotify")
-    def stop_notify(self) -> None:
-        self._link.notifying = False
-
-    @dbus_method(name="Confirm")
-    def confirm(self) -> None:
-        self._link.confirmed()
-
-    def indicate(self, data: bytes) -> None:
-        self.data = data
-        self.emit_properties_changed({"Value": data})
+    @dbus_property(access=PropertyAccess.READ, name="NotifyAcquired")
+    def notify_acquired(self) -> DBusBool:
+        # Its presence has BlueZ ask for a channel; its value, whether an app holds one.
+        return self._link.acquired
 
 
 class _Advertisement(ServiceInterface):
@@ -167,11 +165,65 @@ class _Advertisement(ServiceInterface):
         log.info("BlueZ released the set-up advertisement")
 
 
+class _Channel:
+    """One app's channel for indications: the robot's end of the socket pair it gave BlueZ
+    through ``AcquireNotify``. ``closed`` is called once it closes, from either end."""
+
+    def __init__(self, end: socket.socket, closed: Callable[["_Channel"], None]) -> None:
+        self._end = end
+        self._closed = closed
+        self._heard = asyncio.Event()  # a confirmation came, or the channel closed
+        self.open = True
+        self._loop = asyncio.get_running_loop()
+        self._loop.add_reader(end.fileno(), self._readable)
+
+    async def indicate(self, fragment: bytes, timeout: float) -> bool:
+        """Whether the app confirmed ``fragment`` within ``timeout`` seconds."""
+        self._heard.clear()
+        try:
+            await self._loop.sock_sendall(self._end, fragment)
+        except OSError:  # BlueZ shut its end down
+            return False
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(self._heard.wait(), timeout)
+        return self.open and self._heard.is_set()
+
+    def close(self) -> None:
+        if not self.open:
+            return
+        self.open = False
+        self._loop.remove_reader(self._end.fileno())
+        self._end.close()
+        self._heard.set()
+        self._closed(self)
+
+    def _readable(self) -> None:
+        try:
+            if self._end.recv(CONFIRMATION_BYTES):
+                self._heard.set()
+                return
+        except BlockingIOError:
+            return
+        except OSError:
+            pass
+        self.close()  # BlueZ closed its end
+
+
+@dataclass
+class _App:
+    """What the link keeps of an app connected."""
+
+    mtu: int = DEFAULT_MTU
+    joiner: Joiner = field(default_factory=Joiner)
+    # One message at a time: each fragment is confirmed before the next.
+    sending: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+
 class BluezSetupLink(SetupLink):
     """Offers the set-up service on the Bluetooth controller ``adapter`` (``hci0``),
     through BlueZ on the D-Bus ``bus``: ``system``, or the address of another bus, as the
-    tests use. An app that does not confirm an indication within ``confirm_timeout``
-    seconds is dropped.
+    tests use. An app that has not enabled indications, or does not confirm one, within
+    ``confirm_timeout`` seconds of the robot's sending is dropped.
 
     Apps are named by their BlueZ device's object path. One connects with its first
     write; it leaves when BlueZ says the device disconnected, or when it is dropped.
@@ -183,7 +235,6 @@ class BluezSetupLink(SetupLink):
         self.adapter_path = f"/org/bluez/{adapter}"
         self.bus_address = bus
         self.confirm_timeout = positive("confirm_timeout", confirm_timeout)
-        self.notifying = False
         self._bus: MessageBus | None = None
         self._service = _Service()
         self._request = _Request(self)
@@ -191,14 +242,19 @@ class BluezSetupLink(SetupLink):
         self._advertisement = _Advertisement()
         self._offered = False
         self._advertised = False
-        self._peers: dict[str, tuple[Joiner, int]] = {}  # device path -> its joiner and MTU
+        self._apps: dict[str, _App] = {}  # device path -> the app connected through it
+        self._channels: dict[str, _Channel] = {}  # device path -> its channel for indications
+        self._changed = asyncio.Event()  # set, then replaced, when a channel comes or an app leaves
         self._events: asyncio.Queue[LinkEvent] = asyncio.Queue()
-        self._confirmation: asyncio.Event = asyncio.Event()
-        self._sending = asyncio.Lock()  # one message at a time: each fragment is confirmed
         self._tasks: set[asyncio.Task[None]] = set()  # drops started from BlueZ's calls
 
+    @property
+    def acquired(self) -> bool:
+        """Whether an app holds a channel for indications."""
+        return bool(self._channels)
+
     async def open(self) -> None:
-        self._bus = await connect(self.bus_address)
+        self._bus = await connect(self.bus_address, unix_fds=True)
         self._bus.add_message_handler(self._on_message)
         await watch(
             self._bus,
@@ -213,6 +269,8 @@ class BluezSetupLink(SetupLink):
     async def close(self) -> None:
         with contextlib.suppress(Exception):
             await self.stop()
+        for channel in list(self._channels.values()):
+            channel.close()
         if self._bus is not None:
             self._bus.disconnect()
             self._bus = None
@@ -250,8 +308,10 @@ class BluezSetupLink(SetupLink):
 
     async def stop(self) -> None:
         await self.advertise(False)
-        for peer in list(self._peers):
+        for peer in list(self._apps):
             await self.drop(peer)
+        for channel in list(self._channels.values()):  # apps that never wrote
+            channel.close()
         if self._offered:
             self._offered = False
             await self._bluez(self.adapter_path, GATT_MANAGER, "UnregisterApplication", "o", [ROOT])
@@ -260,26 +320,27 @@ class BluezSetupLink(SetupLink):
         return await self._events.get()
 
     async def send(self, peer: str, message: bytes) -> None:
-        async with self._sending:
-            entry = self._peers.get(peer)
-            if entry is None:
-                return
-            for fragment in split(message, entry[1]):
-                if peer not in self._peers:
+        app = self._apps.get(peer)
+        if app is None:
+            return
+        async with app.sending:
+            for fragment in split(message, app.mtu):
+                channel = await self._channel(peer, app)
+                if self._apps.get(peer) is not app:
+                    return  # it left
+                if channel is None:
+                    log.warning("an app did not enable set-up's indications: dropped")
+                    await self.drop(peer)
                     return
-                self._confirmation.clear()
-                self._answer.indicate(fragment)
-                try:
-                    await asyncio.wait_for(self._confirmation.wait(), self.confirm_timeout)
-                except TimeoutError:
+                if not await channel.indicate(fragment, self.confirm_timeout):
                     log.warning("an app did not confirm a set-up fragment: dropped")
                     await self.drop(peer)
                     return
 
     async def drop(self, peer: str) -> None:
-        if self._peers.pop(peer, None) is None:
+        if peer not in self._apps:
             return
-        self._events.put_nowait(Disconnected(peer))
+        self._left(peer)
         with contextlib.suppress(ConnectionError):  # it may be gone already
             await self._bluez(peer, DEVICE, "Disconnect")
 
@@ -287,18 +348,17 @@ class BluezSetupLink(SetupLink):
 
     def written(self, fragment: bytes, options: dict[str, Variant]) -> None:
         """A fragment an app wrote to the request characteristic."""
-        peer = options["device"].value if "device" in options else ""
-        if not peer.startswith(self.adapter_path + "/"):
+        peer = self._device(options)
+        if peer is None:
             log.warning("a set-up fragment came from no known device; ignored")
             return
-        mtu = int(options["mtu"].value) if "mtu" in options else DEFAULT_MTU
-        entry = self._peers.get(peer)
-        if entry is None:
-            entry = (Joiner(), mtu)
+        app = self._apps.get(peer)
+        if app is None:
+            app = self._apps[peer] = _App()
             self._events.put_nowait(Connected(peer))
-        self._peers[peer] = (entry[0], mtu)
+        app.mtu = _mtu(options)
         try:
-            message = entry[0].add(fragment)
+            message = app.joiner.add(fragment)
         except FragmentError as error:
             log.warning("an app sent a fragment that does not fit (%s): dropped", error)
             task = asyncio.get_running_loop().create_task(self.drop(peer))
@@ -308,11 +368,18 @@ class BluezSetupLink(SetupLink):
         if message is not None:
             self._events.put_nowait(Received(peer, message))
 
-    def confirmed(self) -> None:
-        self._confirmation.set()
-
-    def _on_message(self, message: Message) -> None:
-        """A device's properties changed: one that disconnects leaves."""
+    def _on_message(self, message: Message) -> bool | None:
+        """BlueZ asks for a channel, or a device's properties changed: one that
+        disconnects leaves."""
+        if message.message_type is MessageType.METHOD_CALL:
+            if (message.path, message.interface, message.member) == (
+                ANSWER_PATH,
+                CHARACTERISTIC,
+                "AcquireNotify",
+            ):
+                self._acquire(message)
+                return True
+            return None
         if (
             message.message_type is MessageType.SIGNAL
             and message.member == "PropertiesChanged"
@@ -320,12 +387,89 @@ class BluezSetupLink(SetupLink):
             and message.body[0] == DEVICE
         ):
             connected = message.body[1].get("Connected")
-            if connected is not None and not connected.value and message.path in self._peers:
-                del self._peers[message.path]
-                self._events.put_nowait(Disconnected(message.path))
+            if connected is not None and not connected.value:
+                self._left(message.path)
+        return None
+
+    def _acquire(self, request: Message) -> None:
+        """Answer ``AcquireNotify``: an app enabled indications. It gets a channel of its
+        own, as bluetoothctl's GATT server makes one (client/gatt.c, ``create_sock``)."""
+        assert self._bus is not None
+        options = request.body[0] if request.signature == "a{sv}" else {}
+        peer = self._device(options)
+        if peer is None:
+            self._bus.send(Message.new_error(request, FAILED, "no known device"))
+            return
+        try:
+            ours, theirs = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        except OSError as error:
+            log.warning("no channel for an app's indications (%s)", error.strerror)
+            self._bus.send(Message.new_error(request, FAILED, "no channel"))
+            return
+        for end in (ours, theirs):
+            end.setblocking(False)
+        old = self._channels.get(peer)  # the app enabled indications again
+        self._hold(peer, _Channel(ours, functools.partial(self._lost, peer)))
+        if old is not None:
+            old.close()
+        # dbus-fast sends the descriptor when it writes the reply, and keeps no copy.
+        sent = self._bus.send(
+            Message.new_method_return(request, "hq", [0, _mtu(options)], unix_fds=[theirs.fileno()])
+        )
+        sent.add_done_callback(lambda _: theirs.close())
+
+    def _lost(self, peer: str, channel: _Channel) -> None:
+        """``channel`` closed."""
+        if self._channels.get(peer) is channel:
+            self._hold(peer, None)
+
+    def _left(self, peer: str) -> None:
+        """``peer`` is gone: by BlueZ's word, or dropped."""
+        if (channel := self._channels.get(peer)) is not None:
+            channel.close()
+        if self._apps.pop(peer, None) is not None:
+            self._events.put_nowait(Disconnected(peer))
+            self._wake()
+
+    def _hold(self, peer: str, channel: _Channel | None) -> None:
+        """Keep ``channel`` as the channel of ``peer``, or none."""
+        held = self.acquired
+        if channel is None:
+            del self._channels[peer]
+        else:
+            self._channels[peer] = channel
+        if held != self.acquired:
+            self._answer.emit_properties_changed({"NotifyAcquired": self.acquired})
+        self._wake()
+
+    def _wake(self) -> None:
+        """Wake the sends waiting for a channel."""
+        self._changed.set()
+        self._changed = asyncio.Event()
+
+    async def _channel(self, peer: str, app: _App) -> _Channel | None:
+        """The channel of ``app``, once it has one, within ``confirm_timeout``; None if it
+        has none by then, or has left."""
+        with contextlib.suppress(TimeoutError):
+            async with asyncio.timeout(self.confirm_timeout):
+                while self._apps.get(peer) is app:
+                    if (channel := self._channels.get(peer)) is not None:
+                        return channel
+                    await self._changed.wait()
+        return None
+
+    def _device(self, options: dict[str, Variant]) -> str | None:
+        """The device BlueZ names in ``options``, if it is one of this controller's."""
+        peer = options["device"].value if "device" in options else ""
+        return peer if peer.startswith(self.adapter_path + "/") else None
 
     async def _bluez(
         self, path: str, interface: str, member: str, signature: str = "", body: Sequence[Any] = ()
     ) -> list[Any]:
         assert self._bus is not None, "the link is not open"
         return await call(self._bus, BLUEZ, path, interface, member, signature, body)
+
+
+def _mtu(options: dict[str, Variant]) -> int:
+    """The ATT MTU BlueZ gives in ``options``."""
+    return int(options["mtu"].value) if "mtu" in options else DEFAULT_MTU
