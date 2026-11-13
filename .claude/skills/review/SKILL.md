@@ -20,6 +20,7 @@ Read whole files only where a hunk cannot be judged alone (an enclosing function
 ## 2. Run the checks
 
 - Python (`software/`): `ruff check . && ruff format --check . && pytest -q`.
+- Shell scripts (`tools/`): `shellcheck` on each, and a run on the Pi, as an ordinary user, of what the change touches.
 - Renderer (`ui/`), with the repository root served (`python3 -m http.server 8000` from the root):
   - the tests: `google-chrome --headless=new --virtual-time-budget=30000 --dump-dom http://127.0.0.1:8000/ui/tests/runtime.html > result.html`, then `python3 ui/tests/result.py result.html`;
   - the same tests on a one-file build: `python3 ui/tools/single_file.py --page tests/runtime.html --out ui/tests/runtime-single.html`, then the same two steps on `/ui/tests/runtime-single.html` (git ignores the build);
@@ -59,6 +60,11 @@ A failing check is a finding; fix it before reading further.
 - Text is measured with the font it is drawn with (`text.js`) and cut by characters (`clip`), not by UTF-16 units.
 - The glow is costly: static shapes go through `cached()` (`scenes/kit.js`); look for blurred shapes redrawn every frame.
 - Modules keep to the import and export forms `ui/tools/single_file.py` lists.
+
+### System services and the Pi's set-up (`adapters/`, `tools/pi/`)
+
+- A change that relies on how a system service behaves (BlueZ, NetworkManager) is checked against the version Ubuntu 26.04 ships, with Ubuntu's patches, not against upstream's newest. It runs on the Pi with as many clients as the feature serves: the fakes model the documented behaviour, not a version's bugs. Two apps at once found that BlueZ 5.85 closed one app's channel when the other left (ADR-0020).
+- Set-up scripts in `tools/pi/` ask for no root: they print the root commands, which the README lists too.
 
 ### Tests
 

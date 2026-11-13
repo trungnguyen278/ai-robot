@@ -58,6 +58,7 @@
 - **GPIO:** `RPi.GPIO` **does not work** on the Pi 5 (GPIO lives on the RP1). Use `gpiozero` (with the `lgpio` backend), `lgpio` or `libgpiod`; `rpi-lgpio` runs legacy RPi.GPIO code.
 - **gpiochip numbering:** the header used to be `gpiochip4`; newer kernels add a `gpiochip0` alias → never hard-code it, use `gpiodetect`/`gpioinfo`.
 - **Camera:** libcamera, Picamera2, rpicam-apps. On Ubuntu, libcamera and rpicam-apps come from Ubuntu's archive, but Picamera2 and the IMX500's firmware do not ([AI Camera notes](raspberry-pi-ai-camera.md)).
+- **Bluetooth:** Ubuntu 26.04 ships BlueZ 5.85 (`bluez` 5.85-4ubuntu0.4, checked 2026-11-13). It lacks upstream commit [`f7e2cd91`](https://git.kernel.org/pub/scm/bluetooth/bluez.git/commit/?id=f7e2cd91c2669cf50d07fe05caedf794e88f7476), first released in BlueZ 5.88. Without that commit, a disconnecting app takes another app's notification channel with it. The robot runs Ubuntu's package rebuilt with that commit, and holds it ([ADR-0020](../../docs/decisions/0020-patched-bluez.md), [how](../../tools/pi/README.md#a-patched-bluez)).
 
 ## Checked on the robot's Pi
 

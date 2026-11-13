@@ -39,7 +39,9 @@ description: Raspberry Pi 5 (8 GB) platform knowledge and checklists for this ro
   - Picamera2 and the IMX500's firmware are not in Ubuntu's archive (`hardware/components/raspberry-pi-ai-camera.md`);
   - Ubuntu's image puts the serial console on UART0 (GPIO 14/15, `ttyAMA0`), not on the debug connector: move it before wiring UART0;
   - Ubuntu loads the Wi-Fi driver without the options Raspberry Pi OS ships for stability (`options brcmfmac roamoff=1 feature_disable=0x282000`): add them in `/etc/modprobe.d/`;
-  - the Chromium snap cannot use the Pi 5's GPU: snapd's `opengl` interface does not cover its PCIe path (`docs/devlog/2026-11.md`).
+  - the Chromium snap cannot use the Pi 5's GPU: snapd's `opengl` interface does not cover its PCIe path (`docs/devlog/2026-11.md`);
+  - `bluez` is Ubuntu's, rebuilt with an upstream fix, and held (ADR-0020). Never unhold it or install Ubuntu's own while `tools/pi/patched-bluez.sh build` still adds a patch. After a new Ubuntu `bluez`, rebuild it as `tools/pi/README.md` says.
+- What the Pi needs beyond Ubuntu's image, and how to set it up, goes in `tools/pi/`: scripts that need no root, and a README with the root commands. Facts go in `hardware/components/raspberry-pi-5.md`, with their sources.
 
 ## When the reference is missing something
 
