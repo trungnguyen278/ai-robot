@@ -1,0 +1,5 @@
+# /dev/uinput for root and the uinput group, which only ai-robot-wake has
+# (docs/decisions/0021-sleep-and-wake.md). static_node: the node exists from boot, made by
+# kmod-static-nodes before the module loads on its first open, and takes these permissions
+# then (udev(7)).
+KERNEL=="uinput", SUBSYSTEM=="misc", GROUP="uinput", MODE="0660", OPTIONS+="static_node=uinput"

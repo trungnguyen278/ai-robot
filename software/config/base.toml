@@ -99,6 +99,11 @@ voice_rate = 25.0  # voice levels sent to the screen per second, at most
 reaction_seconds = 3.0  # how long an expression the cloud asks for lasts, unless it says
 reaction_max_seconds = 30.0  # the longest such expression
 scene_max_seconds = 86400.0  # the longest a scene the cloud asks for may stay (a day)
+# "Sleep after" (docs/decisions/0021-sleep-and-wake.md): the minutes with nothing going
+# on before the robot sleeps and its screen turns off. The owner picks one of
+# sleep_choices, or never, in the settings; this is the value as shipped.
+sleep_after = 5
+sleep_choices = [1, 2, 5, 10, 30]
 
 # ---- Raspberry Pi peripherals ----
 
@@ -164,6 +169,15 @@ port = 8770
 send_timeout = 1.0  # seconds a page may take to accept a message before it is dropped
 heartbeat = 10.0  # seconds between pings that find a page gone silent
 close_timeout = 2.0  # seconds a page may take to acknowledge the end of the connection
+
+# Lights the screen when the kiosk turned it off (docs/decisions/0021-sleep-and-wake.md).
+# "helper" asks ai-robot-wake, which tools/pi/kiosk.sh installs; "sim" lights nothing.
+[ports.display_power]
+adapter = "sim"
+
+[ports.display_power.helper]
+path = "/run/ai-robot-wake.sock"  # where the helper listens: tools/pi/kiosk.sh puts its socket here
+timeout = 1.0  # seconds the helper may take to answer
 
 # The link to ai-cloud (platform/protocols/cloud/README.md). "sim" until a server exists;
 # "websocket" with the server's address, set in local.toml (see local.example.toml).

@@ -23,6 +23,7 @@ import { EXAMPLE, KINDS, PanelView, TARGET } from '../src/panel.js';
 import { EYE, FACE } from '../src/pose.js';
 import { Press } from '../src/press.js';
 import { SCENES, sceneSlot, sceneTone } from '../src/scenes/index.js';
+import { ASLEEP, SLEEPY, Sleep } from '../src/sleep.js';
 import { CORNER } from '../src/scenes/kit.js';
 import { CODE_LENGTH, DISCRIMINATOR_LENGTH, LINK_LENGTH, STATES } from '../src/scenes/setup.js';
 import { LABEL_LENGTH } from '../src/scenes/timer.js';
@@ -395,6 +396,25 @@ function checkProtocol() {
   link.hello({ protocol: PROTOCOL, revision: 'b' });
   check(reloads.length === 1, 'hello', 'a new revision must reload the page');
 
+  // What the software sends reaches the face, and the robot's sleep.
+  const followed = [];
+  const sleep = {
+    follow: (asleep) => {
+      followed.push(asleep);
+      return false; // the face is the software's
+    },
+  };
+  const awake = { animator: still(), status: {}, offset: 0, now: () => 2 };
+  const reloaded = [];
+  const linked = new Link(awake, { url: 'ws://unused', sleep, reload: () => reloaded.push(true) });
+  linked.receive('not JSON');
+  linked.receive(JSON.stringify({ type: 'state', face: { expression: 'sad' }, asleep: false }));
+  check(same(followed, [false]) && awake.animator.layers.at(-1).name === 'sad', 'link',
+    'a state must reach the face and the sleep, and text that is not JSON nothing');
+  linked.receive(JSON.stringify({ type: 'hello', protocol: PROTOCOL, revision: 'a' }));
+  linked.receive(JSON.stringify({ type: 'hello', protocol: PROTOCOL, revision: 'b' }));
+  check(reloaded.length === 1, 'link', 'a greeting received must be checked');
+
   // What the renderer reports: a button's action has no value.
   const sent = [];
   link.socket = { readyState: WebSocket.OPEN, send: (text) => sent.push(JSON.parse(text)) };
@@ -591,6 +611,123 @@ function checkPanel() {
 }
 
 // A press held still is a hold; one that moves or ends is not.
+// A wake lock that grants or refuses as told, and a page that shows or hides.
+function fakeWakeLock() {
+  const lock = {
+    requests: 0,
+    refuse: false,
+    held: [], // the locks granted and not yet let go
+    request(type) {
+      this.requests += 1;
+      if (type !== 'screen' || this.refuse) return Promise.reject(new Error('refused'));
+      const granted = new EventTarget();
+      granted.release = () => {
+        lock.held = lock.held.filter((l) => l !== granted);
+        granted.dispatchEvent(new Event('release'));
+        return Promise.resolve();
+      };
+      lock.held.push(granted);
+      return Promise.resolve(granted);
+    },
+  };
+  return lock;
+}
+
+async function checkSleep() {
+  const flush = async () => {
+    for (let i = 0; i < 5; i += 1) await Promise.resolve();
+  };
+  const face = (player) => player.animator.layers.at(-1).name;
+
+  // Without sleep (the studio), asleep still shows the sleeping face, and no scene or panel.
+  const shown = [];
+  const panels = { show: (panel) => shown.push(panel) };
+  const bare = { animator: still(), status: {}, offset: 0, now: () => 2 };
+  apply({ type: 'state', face: { expression: 'happy' }, scene: { name: 'clock' }, panel: EXAMPLE, asleep: true },
+    bare, panels);
+  check(face(bare) === ASLEEP && bare.animator.scene === null && shown[0] === null, 'sleep',
+    'asleep, the face must sleep, with no scene or panel');
+  apply({ type: 'state', face: { expression: 'happy' }, asleep: 'yes' }, bare);
+  check(face(bare) === 'happy', 'sleep', 'only asleep: true puts the face to sleep');
+
+  const timers = fakeTimers();
+  const wakeLock = fakeWakeLock();
+  const page = new EventTarget();
+  page.visibilityState = 'visible';
+  const player = { animator: still(), status: {}, offset: 0, now: () => 2 };
+  const sleep = new Sleep(player, { drowsy: 3, release: 2, wakeLock, page, timers });
+  const state = (asleep, expression = 'happy') => {
+    apply({ type: 'state', face: { expression }, scene: { name: 'clock' }, asleep }, player, null, sleep);
+  };
+
+  state(false);
+  state(false); // before the first request is answered
+  await flush();
+  check(wakeLock.requests === 1 && wakeLock.held.length === 1 && face(player) === 'happy', 'sleep',
+    'awake, the page must hold one wake lock, asked for once');
+  state(false, 'sad');
+  await flush();
+  check(wakeLock.requests === 1 && face(player) === 'sad', 'sleep', 'a held lock must not be asked for again');
+
+  state(true);
+  check(face(player) === SLEEPY && player.animator.scene === null, 'sleep', 'falling asleep, the face must grow sleepy');
+  check(same([...timers.pending.values()].map((t) => t.ms), [3000, 5000]), 'sleep',
+    'the eyes must close after drowsy, and the lock go after drowsy + release');
+  state(true, 'love');
+  check(timers.pending.size === 2 && face(player) === SLEEPY, 'sleep', 'a state while asleep must not start again');
+  timers.runAll();
+  check(face(player) === ASLEEP && wakeLock.held.length === 0, 'sleep', 'asleep, the eyes close and the lock goes');
+  page.dispatchEvent(new Event('visibilitychange'));
+  await flush();
+  check(wakeLock.requests === 1, 'sleep', 'asleep, a page that shows again must not ask for the lock');
+
+  state(false, 'neutral');
+  await flush();
+  check(face(player) === 'neutral' && wakeLock.held.length === 1, 'sleep', 'woken, the face and the lock come back');
+
+  // Woken before the lock went: it is still held, and nothing is left to run.
+  state(true);
+  state(false);
+  await flush();
+  check(timers.pending.size === 0 && wakeLock.requests === 2 && wakeLock.held.length === 1, 'sleep',
+    'woken while drowsy, the lock must stay and the timers go');
+
+  // The browser lets the lock go as the page hides, and refuses it until it shows.
+  page.visibilityState = 'hidden';
+  wakeLock.held[0].release();
+  await flush();
+  check(wakeLock.requests === 2, 'sleep', 'a hidden page must not ask for the lock');
+  page.visibilityState = 'visible';
+  page.dispatchEvent(new Event('visibilitychange'));
+  await flush();
+  check(wakeLock.held.length === 1, 'sleep', 'a page shown again must hold the lock again');
+
+  // A lock the browser lets go while the page shows is asked for again at once; granted
+  // after the robot fell asleep, it goes at once.
+  const asked = wakeLock.requests;
+  wakeLock.held[0].release();
+  check(wakeLock.requests === asked + 1, 'sleep', 'a lock the browser lets go must be asked for again');
+  state(true);
+  await flush();
+  check(wakeLock.held.length === 0, 'sleep', 'a lock granted while asleep must go');
+  timers.runAll();
+
+  // Refused, it is asked for again when the page shows again.
+  wakeLock.refuse = true;
+  state(false);
+  await flush();
+  wakeLock.refuse = false;
+  page.dispatchEvent(new Event('visibilitychange'));
+  await flush();
+  check(wakeLock.held.length === 1, 'sleep', 'a refused lock must be asked for again');
+
+  // Without the Wake Lock API, sleep still shows.
+  const plain = { animator: still(), status: {}, offset: 0, now: () => 2 };
+  const without = new Sleep(plain, { drowsy: 3, release: 2, wakeLock: null, page: null, timers: fakeTimers() });
+  apply({ type: 'state', face: {}, asleep: true }, plain, null, without);
+  check(face(plain) === SLEEPY, 'sleep', 'without a wake lock, the face must still fall asleep');
+}
+
 function checkPress() {
   const timers = fakeTimers();
   const holds = [];
@@ -670,6 +807,7 @@ function showSheet() {
     checkSceneText();
     checkProtocol();
     checkPanel();
+    await checkSleep();
     checkPress();
     checkStatusRow();
     showSheet();

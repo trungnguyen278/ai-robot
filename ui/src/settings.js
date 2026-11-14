@@ -59,6 +59,12 @@ export const SETTINGS = Object.freeze({
     slop: 16, // CSS pixels a held press may wander, as the finger rolls, and still count
   }),
 
+  // Falling asleep, once the software says the robot sleeps (sleep.js).
+  sleep: Object.freeze({
+    drowsy: 3, // seconds of a sleepy face before the eyes close
+    release: 2, // seconds of closed eyes before the screen may turn off
+  }),
+
   panel: Object.freeze({
     idle: 60, // seconds without a touch before a panel, such as the settings, closes itself
   }),

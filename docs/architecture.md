@@ -102,7 +102,7 @@ software/                     a colcon workspace
 
 ### The edges
 
-The screen is the exception that is real already: the `screen` module decides what it shows (the expression, a scene such as the clock or the weather, the gaze, the battery), and a renderer page in [`ui/`](../ui/README.md), shown full screen by a browser, draws it and keeps the face alive on its own. They talk over the [screen protocol](../protocol/screen/README.md) ([ADR-0006](decisions/0006-screen-renderer.md)). On the robot, Ubuntu Frame shows the page in Chromium, in kiosk mode (ADR-0017).
+The screen is the exception that is real already: the `screen` module decides what it shows (the expression, a scene such as the clock or the weather, the gaze, the battery), and a renderer page in [`ui/`](../ui/README.md), shown full screen by a browser, draws it and keeps the face alive on its own. They talk over the [screen protocol](../protocol/screen/README.md) ([ADR-0006](decisions/0006-screen-renderer.md)). On the robot, Ubuntu Frame shows the page in Chromium, in kiosk mode (ADR-0017). The robot decides when it sleeps; the page then lets the screen turn off, and the robot lights it again when it wakes ([ADR-0021](decisions/0021-sleep-and-wake.md)).
 
 The `cloud` module links the robot to `ai-cloud` over the [cloud link](https://github.com/trungnguyen278/ai-platform/blob/main/protocols/cloud/README.md), which ai-platform defines.
 - **Version 3.0** keeps a WebSocket open to `ai-cloud` for the session, and joins a LiveKit room only to talk, one for each conversation ([ai-platform ADR-0006](https://github.com/trungnguyen278/ai-platform/blob/main/docs/decisions/0006-two-channels.md)).

@@ -69,3 +69,65 @@ The build stops with `Ubuntu's bluez <version> already has <patch>: drop it`. Th
 The script asks for no root and nothing of the machine but apt's sources and the build dependencies. The images of [ADR-0014](../../docs/decisions/0014-updates.md) are to be built the same way:
 - on arm64, in an Ubuntu 26.04 container prepared as above;
 - the image then installs the packages the build made, in place of Ubuntu's.
+
+## The kiosk
+
+The robot's screen is a kiosk: Ubuntu Frame (the `ubuntu-frame` snap) shows Chromium (the `chromium` snap, run as its daemon), which opens the page the robot's software serves. The screen sleeps and wakes with the robot ([ADR-0021](../../docs/decisions/0021-sleep-and-wake.md)):
+- while the robot is awake, the page holds a Screen Wake Lock, and Frame keeps the screen on;
+- once the robot sleeps and its face has closed its eyes, the page lets the lock go, and Frame turns the screen off 15 s later (`idle-timeout`);
+- when the robot wakes, the software asks `ai-robot-wake` to light the screen. That helper presses `KEY_WAKEUP` on a keyboard of its own, which has no other key, at most once a second.
+
+[`kiosk.sh`](kiosk.sh) sets all of this up from the files in [`kiosk/`](kiosk/):
+
+| File | Installed as | What it does |
+|---|---|---|
+| `frame.config` | Frame's `config` option | no pointer; the screen off after 15 s without input or a wake lock; the idle-inhibit protocol, which the wake lock needs and Mir does not offer by default |
+| `chromium.conf` | a drop-in for `snap.chromium.daemon.service` | Chromium starts with Frame and the robot, once the robot serves its page; it stops and starts with Frame, and starts again whenever it exits |
+| `ai-robot.service` | `/etc/systemd/system/` | the robot's software, as its user, from this tree, with the profile given |
+| `ai-robot-wake.socket` | `/etc/systemd/system/` | the helper's socket, at the robot's `[ports.display_power.helper] path`, for root and the robot's group only |
+| `ai-robot-wake.service` | `/etc/systemd/system/` | the helper, as a dynamic user with the `uinput` group only, allowed no device but `/dev/uinput`; its program is copied to `/usr/local/libexec/ai-robot-wake`, where only root may change it |
+| `70-ai-robot-uinput.rules` | `/etc/udev/rules.d/` | `/dev/uinput` for root and the `uinput` group |
+
+The robot's own user leaves the `uinput` and `input` groups, if it was in them: with either, it could type into the kiosk's Chromium, which runs as root without its sandbox.
+
+### Set it up
+
+The robot's software first ([`software/README.md`](../../software/README.md)), and the snaps:
+
+```sh
+sudo snap install ubuntu-frame chromium
+```
+
+The profile must light the screen through the helper. The `pi` profile does; for another, such as `desktop` on a Pi without the robot's hardware, add this to `software/config/local.toml`:
+
+```toml
+[ports.display_power]
+adapter = "helper"
+```
+
+Then, as the robot's user, in its tree, into a new folder:
+
+```sh
+tools/pi/kiosk.sh install pi ~/kiosk
+```
+
+It asks for no root:
+- it reads the screen's port and the helper's socket from the profile's configuration;
+- it writes the files above into the folder, laid out as they go on the machine (`etc/`, `usr/`), and Frame's config option beside them;
+- it prints the root commands that install them, remove the robot's user from the two groups, and restart the helper, the robot, Frame and Chromium.
+
+Run those commands as root, in their order. Changing Frame's config restarts Frame (its configure hook), and Chromium with it.
+
+### Check it
+
+```sh
+tools/pi/kiosk.sh check pi
+```
+
+It says what differs from what `install` sets up, and exits with status 1 if anything does:
+- Frame's config, as Frame's own config file holds it, and the page that Chromium shows, from its command line;
+- each installed file, and the helper's copy, against this tree's;
+- the groups of the robot's user, and `/dev/uinput`'s owner and mode;
+- whether the units run and start at boot.
+
+Run it again after pulling a change to `tools/pi/kiosk/` or to the helper, and `install` again if it reports one. It needs no root either.

@@ -25,6 +25,7 @@ from ai_robot.ports.screen import (
     Action,
     Close,
     Hold,
+    Opened,
     Panel,
     PanelItem,
     Screen,
@@ -205,6 +206,7 @@ class WebScreen(Screen):
                 "muted": state.muted,
             },
             "panel": panel_message(state.panel),
+            "asleep": state.asleep,
             "time": time.time(),
         }
 
@@ -254,6 +256,7 @@ class WebScreen(Screen):
                 message.get("shape"),
             )
             self._check_names()
+            self._events.put_nowait(Opened())
         elif kind in ("touch", "hold"):
             x, y = message.get("x"), message.get("y")
             if _fraction(x) and _fraction(y):

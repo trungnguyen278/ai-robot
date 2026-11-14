@@ -24,6 +24,8 @@ from ai_robot.messages import (
     SettingKind,
     SettingSection,
     SoundLevel,
+    WakeReason,
+    WakeUp,
 )
 from ai_robot.ports import (
     AudioIn,
@@ -245,6 +247,7 @@ class VoiceModule(Module):
                 self.wake_word.reset()  # so that the same words are not spotted twice
             if wake_word is not None and not (self.conversation is not None and self.listen):
                 self.log.info("heard %r", wake_word)
+                self.bus.publish(WakeUp(self.name, WakeReason.WAKE_WORD))
                 await self._open(Trigger.WAKE_WORD)
             elif self.conversation is not None:
                 await self._hear(chunk, voiced)

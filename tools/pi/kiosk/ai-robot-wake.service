@@ -1,0 +1,49 @@
+# ai-robot-wake, the helper that lights the screen for the robot: it presses KEY_WAKEUP on a
+# uinput keyboard that has no other key (docs/decisions/0021-sleep-and-wake.md). It runs as a
+# user of its own with the uinput group only, and may touch no device but /dev/uinput.
+# tools/pi/kiosk.sh installs it, with its program copied from the robot's tree to
+# /usr/local/libexec, where only root may change it.
+[Unit]
+Description=ai-robot-wake, which lights the screen for the robot
+Requires=ai-robot-wake.socket
+After=ai-robot-wake.socket
+
+[Service]
+# --interval: seconds between two presses, however often the robot asks.
+# --settle: seconds between creating the keyboard and the first press, for the compositor to
+#   take the new keyboard up.
+# --read-timeout: seconds a connection may take to send its request.
+ExecStart=/usr/bin/python3 -I /usr/local/libexec/ai-robot-wake --interval 1 --settle 0.5 --read-timeout 1
+Restart=on-failure
+RestartSec=5
+
+DynamicUser=yes
+SupplementaryGroups=uinput
+DevicePolicy=closed
+DeviceAllow=/dev/uinput w
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+PrivateNetwork=yes
+IPAddressDeny=any
+RestrictAddressFamilies=AF_UNIX
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
+UMask=0077
+
+[Install]
+# From boot, so that the compositor knows the keyboard before the robot first needs it.
+WantedBy=multi-user.target

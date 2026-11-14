@@ -12,7 +12,8 @@
      voice: "listen" (the eyes swell) or "talk" (the mouth moves).
 
    Shapes and colours follow the previous generation's design (ui/legacy/). The names
-   required by the screen protocol are listed in protocol/screen/vocabulary.json.
+   required by the screen protocol are listed in protocol/screen/vocabulary.json; the
+   page shows `asleep` on its own, while the robot sleeps (sleep.js).
 */
 
 export const EXPRESSIONS = {
@@ -128,6 +129,16 @@ export const EXPRESSIONS = {
     motion: { type: 'shake', freq: 7, amp: 1.4 },
     effect: 'sweat',
     life: { blink: 1.6, glance: 1.8, breathe: 0 },
+  },
+
+  // Not one the software asks for: the page's own, while the robot sleeps.
+  asleep: {
+    tone: 'purple',
+    face: { y: 8 },
+    eyes: { y: 28, h: 10, r: 5 }, // shut, where sleepy's lids meet
+    motion: 'drift',
+    effect: 'zzz',
+    life: { blink: 0, glance: 0, breathe: 1.6 },
   },
 };
 
