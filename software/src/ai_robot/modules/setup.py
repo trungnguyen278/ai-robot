@@ -312,7 +312,13 @@ class SetupModule(Module):
         if data is None:
             self.bus.publish(SceneRequest(self.name, None))
         else:
-            self.bus.publish(SceneRequest(self.name, SCENE, data, priority=ScreenPriority.ALERT))
+            # Set-up going on keeps the robot awake; the scene of a robot not set up does not.
+            awake = data["state"] != "closed"
+            self.bus.publish(
+                SceneRequest(
+                    self.name, SCENE, data, priority=ScreenPriority.ALERT, keep_awake=awake
+                )
+            )
 
     # ---- what changes it ----
 

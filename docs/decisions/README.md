@@ -28,3 +28,4 @@ Each significant decision is a short file: context, decision, alternatives consi
 | [0018](0018-conversations.md) | Conversations on the robot: one wake word, many turns | Accepted | 2026-10-28 |
 | [0019](0019-setup-button.md) | Set-up without the touch screen: hold the microphones' mute button | Accepted | 2026-10-29 |
 | [0020](0020-patched-bluez.md) | BlueZ: Ubuntu's package with upstream's fix, until Ubuntu ships it | Accepted | 2026-11-13 |
+| [0021](0021-sleep-and-wake.md) | Sleep and wake: the robot decides, the kiosk turns the screen off and on | Accepted | 2026-11-14 |

@@ -107,6 +107,8 @@ class Robot:
         if request.scene is None:
             return None
         assert (request.scene, request.priority) == (SCENE, ScreenPriority.ALERT)
+        # Set-up going on keeps the robot awake; a robot not set up may sleep.
+        assert request.keep_awake is (request.data["state"] != "closed")
         return request.data
 
     async def code_shown(self) -> Mapping[str, Any]:

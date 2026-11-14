@@ -1,0 +1,15 @@
+# The socket of ai-robot-wake, the helper that lights the screen for the robot
+# (docs/decisions/0021-sleep-and-wake.md). Only root and the robot's group may use it.
+# tools/pi/kiosk.sh installs it with the path of the robot's configuration
+# ([ports.display_power.helper] path) and the robot's group.
+[Unit]
+Description=ai-robot-wake's socket
+
+[Socket]
+ListenStream=@SOCKET@
+SocketUser=root
+SocketGroup=@GROUP@
+SocketMode=0660
+
+[Install]
+WantedBy=sockets.target

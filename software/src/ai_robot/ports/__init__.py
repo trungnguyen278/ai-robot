@@ -52,6 +52,7 @@ from ai_robot.ports.cloud import (
     Voice,
 )
 from ai_robot.ports.daylight import Daylight, SunTimes
+from ai_robot.ports.display_power import DisplayPower
 from ai_robot.ports.identity import Identity
 from ai_robot.ports.image import Color, Image
 from ai_robot.ports.listening import VoiceActivity, WakeWord
@@ -68,6 +69,7 @@ from ai_robot.ports.screen import (
     Action,
     Close,
     Hold,
+    Opened,
     Panel,
     PanelItem,
     PanelSection,
@@ -88,6 +90,7 @@ PORT_TYPES: dict[str, type[Port]] = {
     "voice_activity": VoiceActivity,
     "camera": Camera,
     "screen": Screen,
+    "display_power": DisplayPower,
     "cloud": Cloud,
     "identity": Identity,
     "binding": BindingStore,
@@ -128,6 +131,7 @@ __all__ = [
     "Daylight",
     "DeviceInfo",
     "Disconnected",
+    "DisplayPower",
     "DriveBase",
     "EventKind",
     "Frame",
@@ -145,6 +149,7 @@ __all__ = [
     "Network",
     "NetworkState",
     "NetworkStatus",
+    "Opened",
     "Panel",
     "PanelItem",
     "PanelSection",

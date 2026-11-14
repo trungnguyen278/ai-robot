@@ -18,6 +18,7 @@ import waiting
 
 from ai_robot.adapters.sim.binding import SimBindingStore
 from ai_robot.adapters.sim.cloud import SimCloud
+from ai_robot.adapters.sim.display_power import SimDisplayPower
 from ai_robot.adapters.sim.identity import SimIdentity
 from ai_robot.adapters.sim.screen import SimScreen
 from ai_robot.core.bus import Bus
@@ -77,6 +78,7 @@ SCREEN = {
     "reaction_max_seconds": 30.0,
     "scene_max_seconds": 86400.0,
 }
+SLEEP = {"sleep_after": 5, "sleep_choices": [1, 2, 5, 10, 30]}
 
 SWITCH = {
     "type": "object",
@@ -503,8 +505,9 @@ def screen_robot() -> tuple[SimScreen, SimCloud, ScreenModule, CloudModule]:
     bus = Bus()
     screen = SimScreen()
     cloud = SimCloud()
+    ports = {"screen": screen, "display_power": SimDisplayPower()}
     module = ScreenModule(
-        context("screen", bus, {"screen": screen}), quiet_db=-50, loud_db=-10, **SCREEN
+        context("screen", bus, ports), quiet_db=-50, loud_db=-10, **SCREEN, **SLEEP
     )
     return screen, cloud, module, cloud_module(bus, cloud)
 
