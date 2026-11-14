@@ -66,11 +66,16 @@ A failing check is a finding; fix it before reading further.
 - A change that relies on how a system service behaves (BlueZ, NetworkManager) is checked against the version Ubuntu 26.04 ships, with Ubuntu's patches, not against upstream's newest. It runs on the Pi with as many clients as the feature serves: the fakes model the documented behaviour, not a version's bugs. Two apps at once found that BlueZ 5.85 closed one app's channel when the other left (ADR-0020).
 - A D-Bus signal counts only when its sender is the service's current unique name (`Owner.sent`, `adapters/dbus.py`): a match rule's `sender` filters broadcasts only, and the system bus lets any connection send a signal to the robot alone. The owner is followed through `NameOwnerChanged`, so the robot recovers when the service restarts instead of being restarted with it.
 - Set-up scripts in `tools/pi/` ask for no root: they print the root commands, which the README lists too.
+- A web API that needs the compositor fails silently where the compositor does not offer the protocol. Chromium granted a Screen Wake Lock while Frame offered no `zwp_idle_inhibit_manager_v1`, and the screen turned off anyway (ADR-0021). Check on the Pi that the compositor lists the global, and that the effect happens.
+- A group is a privilege. `uinput` creates input devices and `input` writes events into existing ones (`evdev_write`), so either lets a user type into the kiosk's Chromium, which runs as root. A service gets only the groups it needs (`SupplementaryGroups=`), and `systemd-analyze security` scores its unit.
+- What root runs comes from a copy that only root may change, never from the robot's tree, which the robot's user can edit.
+- A snap's daemon restarts only on failure (`Restart=on-failure`). One that exits with status 0, as Chromium does when Frame goes away, stays down unless a drop-in says otherwise.
 
 ### Tests
 
 - Each behaviour change has a test that would fail on the old code; check it is not vacuous (an exact float compare that never matches, a loop that never runs).
 - No fixed sleeps to wait for readiness: wait for the condition, with a timeout.
+- A test that a delay did not end early allows a wide margin, half the delay: on Windows a 0.108 s wait measured 0.093 s.
 
 ### Duplication
 

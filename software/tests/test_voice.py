@@ -32,6 +32,8 @@ from ai_robot.messages import (
     SettingChanged,
     SettingOffered,
     SoundLevel,
+    WakeReason,
+    WakeUp,
 )
 from ai_robot.modules.voice import VoiceModule
 from ai_robot.ports import (
@@ -190,6 +192,7 @@ class Robot:
         self.states = self.bus.subscribe(InteractionChanged)
         self.offers = self.bus.subscribe(ConversationOffered)
         self.expressions = self.bus.subscribe(ExpressionRequest)
+        self.wakes = self.bus.subscribe(WakeUp)
         self.module = VoiceModule(ctx, **{**SETTINGS, **changes})
 
     async def sent(self) -> list[RobotPart]:
@@ -285,6 +288,8 @@ def test_a_wake_word_asks_for_a_conversation_and_streams_from_then_on() -> None:
             request, *speech = await robot.sent()
             assert isinstance(request, ConversationRequest)
             assert request.trigger is Trigger.WAKE_WORD
+            assert robot.wakes.pending == 1  # the screen wakes with it
+            assert await robot.wakes.get() == WakeUp("voice", WakeReason.WAKE_WORD)
             assert uuid.UUID(request.conversation).version == 7
             conversation = request.conversation
             assert speech == [Speech(conversation, VOICE), Speech(conversation, SILENCE)]
@@ -724,6 +729,7 @@ def test_microphones_off_hear_nothing() -> None:
             await robot.microphones.heard(WAKE, VOICE)
             assert await robot.sent() == []  # no conversation
             assert robot.levels.pending == 0  # nothing measured
+            assert robot.wakes.pending == 0  # nor woken
             resets = robot.spotter.resets
             robot.bus.publish(SettingChanged("voice.microphones", True))
             await settle()

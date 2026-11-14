@@ -17,6 +17,7 @@ from ai_robot.core.capabilities import CapabilityHost
 from ai_robot.core.checks import finite, positive
 from ai_robot.core.config import protocol_dir
 from ai_robot.core.module import Module, ModuleContext
+from ai_robot.core.settings import SettingsHost
 from ai_robot.messages import (
     BatteryReport,
     ExpressionRequest,
@@ -31,14 +32,21 @@ from ai_robot.messages import (
     ScreenHeld,
     ScreenPriority,
     ScreenTouched,
+    Setting,
+    SettingKind,
+    SettingSection,
     SoundLevel,
+    WakeReason,
+    WakeUp,
 )
 from ai_robot.ports import (
     Action,
     Capability,
     Close,
+    DisplayPower,
     EventKind,
     Hold,
+    Opened,
     Panel,
     SafetyClass,
     Screen,
@@ -70,6 +78,10 @@ INTERACTION_SOURCE = "interaction"  # the source of the requests made for the co
 CLOUD_REACTION = "cloud.reaction"
 CLOUD_MOOD = "cloud.mood"
 CLOUD_SCENE = "cloud.scene"
+
+SLEEP_SETTING = "screen.sleep_after"
+NEVER = 0  # the "Sleep after" that never sleeps
+SECONDS_PER_MINUTE = 60
 
 TOUCHED = EventKind(
     "screen.touched",
@@ -247,6 +259,7 @@ class Face:
 class Scene:
     name: str
     data: Mapping[str, Any]
+    keep_awake: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -281,10 +294,14 @@ class Arbiter(Generic[T]):
 
     def winner(self, now: float) -> Request[T] | None:
         """The request to show at ``now``; expired ones are dropped."""
+        return max(self.active(now), key=lambda r: (r.priority, r.order), default=None)
+
+    def active(self, now: float) -> list[Request[T]]:
+        """The requests that have not expired at ``now``; expired ones are dropped."""
         for source, request in list(self._requests.items()):
             if request.expires is not None and request.expires <= now:
                 del self._requests[source]
-        return max(self._requests.values(), key=lambda r: (r.priority, r.order), default=None)
+        return list(self._requests.values())
 
     def next_expiry(self) -> float | None:
         times = [r.expires for r in self._requests.values() if r.expires is not None]
@@ -312,11 +329,21 @@ class ScreenModule(Module):
       reaction, at ``ScreenPriority.REACTION``; a mood, at ``AMBIENT``; a scene, at
       ``REACTION``.
 
+    - Sleep (docs/decisions/0021-sleep-and-wake.md): after "Sleep after" minutes
+      with nothing going on, the robot falls asleep: the face closes its eyes, and the
+      screen turns off. Nothing counts while something goes on: a conversation, a
+      scene that keeps it awake (``keep_awake``, such as set-up's code or a timer), or
+      a panel; the count starts again when it ends, and a hold that starts while the
+      robot sleeps wakes it. ``WakeUp`` wakes the robot, or starts the count again.
+      Each tap, hold and action publishes one; a tap on a sleeping robot only wakes it.
+      ``display_power`` lights a dark screen when the robot wakes from anything but a
+      touch, and when a page opens while the robot is awake.
+
     The renderer animates on its own (transitions, blinking, glances, its start-up),
     so this module sends only changes.
     """
 
-    owns = ("screen",)
+    owns = ("screen", "display_power")
 
     def __init__(
         self,
@@ -328,6 +355,8 @@ class ScreenModule(Module):
         reaction_seconds: float,
         reaction_max_seconds: float,
         scene_max_seconds: float,
+        sleep_after: float,
+        sleep_choices: list[float],
     ) -> None:
         super().__init__(ctx)
         # The microphone's loudness, in dBFS, that maps to a voice level of 0 and of 1.
@@ -343,6 +372,34 @@ class ScreenModule(Module):
             raise ValueError("reaction_seconds must not exceed reaction_max_seconds")
         self.scene_max_seconds = positive("scene_max_seconds", scene_max_seconds)
         self.screen = self.port("screen", Screen)
+        self.display = self.port("display_power", DisplayPower)
+        if not sleep_choices or len(set(sleep_choices)) != len(sleep_choices):
+            raise ValueError("sleep_choices must list distinct numbers of minutes")
+        for minutes in sleep_choices:
+            positive("sleep_choices", minutes)
+        if sleep_after != NEVER and sleep_after not in sleep_choices:
+            raise ValueError("sleep_after must be one of sleep_choices, or 0 for never")
+        self.sleep_after = sleep_after  # minutes; NEVER: it does not sleep
+        self.asleep = False
+        self._last_activity = 0.0  # event-loop time when the count started
+        self._held = False  # something goes on that keeps the robot awake
+        self._activity = asyncio.Event()  # the count started again, or stopped
+        self._interaction = InteractionState.IDLE
+        self._keeps_awake: frozenset[str] = frozenset()  # the cloud's scenes that do
+        self.settings = SettingsHost(self)
+        choices = [{"const": m, "title": _minutes(m)} for m in sorted(sleep_choices)]
+        self.settings.add(
+            Setting(
+                SLEEP_SETTING,
+                SettingKind.VALUE,
+                SettingSection.DISPLAY,
+                "Sleep after",
+                sleep_after,
+                schema={"oneOf": [*choices, {"const": NEVER, "title": "Never"}]},
+                help="With nothing going on for this long, it sleeps and its screen turns off",
+            ),
+            self._set_sleep_after,
+        )
         self.faces: Arbiter[Face] = Arbiter()
         self.scenes: Arbiter[Scene] = Arbiter()
         self.state: ScreenState | None = None  # what the screen was last given
@@ -365,6 +422,7 @@ class ScreenModule(Module):
         self.gazes = self._subscribe(LookAt)
         self.panel_requests = self._subscribe(PanelRequest)
         self.microphones = self._subscribe(MicrophonesChanged)
+        self.wakes = self._subscribe(WakeUp)
         self.capabilities = CapabilityHost(self)
 
     def _subscribe(self, kind: type[M]) -> Subscription[M]:
@@ -373,8 +431,12 @@ class ScreenModule(Module):
         return subscription
 
     async def start(self) -> None:
+        self._last_activity = self._now()
         await self._refresh()
         vocabulary = await asyncio.to_thread(load_vocabulary)
+        self._keeps_awake = frozenset(
+            name for name, scene in vocabulary["scenes"].items() if scene.get("keeps_awake")
+        )
         offered = capabilities(
             vocabulary,
             reaction_seconds=self.reaction_seconds,
@@ -386,8 +448,10 @@ class ScreenModule(Module):
             self.capabilities.add(capability, handler)
         self.capabilities.add_event(TOUCHED)
         self.capabilities.offer()
+        self.settings.offer()
 
     async def run(self) -> None:
+        await self.settings.apply_pending()
         async with asyncio.TaskGroup() as tasks:
             tasks.create_task(self._follow(self.expression_requests, self._on_expression))
             tasks.create_task(self._follow(self.scene_requests, self._on_scene))
@@ -397,6 +461,9 @@ class ScreenModule(Module):
             tasks.create_task(self._follow(self.gazes, self._on_gaze))
             tasks.create_task(self._follow(self.panel_requests, self._on_panel))
             tasks.create_task(self._follow(self.microphones, self._on_microphones))
+            tasks.create_task(self._follow(self.wakes, self._on_wake))
+            tasks.create_task(self._fall_asleep())
+            tasks.create_task(self.settings.serve())
             tasks.create_task(self._expire())
             tasks.create_task(self._forward_events())
             tasks.create_task(self.capabilities.serve())
@@ -405,6 +472,7 @@ class ScreenModule(Module):
         for subscription in self.subscriptions:
             subscription.close()
         self.capabilities.close()
+        self.settings.close()
 
     @staticmethod
     async def _follow(
@@ -424,7 +492,11 @@ class ScreenModule(Module):
         await self._refresh()
 
     async def _on_scene(self, request: SceneRequest) -> None:
-        scene = None if request.scene is None else Scene(request.scene, request.data)
+        scene = (
+            None
+            if request.scene is None
+            else Scene(request.scene, request.data, request.keep_awake)
+        )
         self.scenes.put(
             request.source,
             scene,
@@ -434,6 +506,7 @@ class ScreenModule(Module):
         await self._refresh()
 
     async def _on_interaction(self, message: InteractionChanged) -> None:
+        self._interaction = message.state
         self.listening = message.state in LISTENING_STATES
         expression = INTERACTION_EXPRESSIONS[message.state]
         face = None if expression is None else Face(expression)
@@ -488,6 +561,20 @@ class ScreenModule(Module):
         now = self._now()
         face = self.faces.winner(now)
         scene = self.scenes.winner(now)
+        held = (
+            self._interaction is not InteractionState.IDLE
+            or any(request.content.keep_awake for request in self.scenes.active(now))
+            or bool(self._panels)
+        )
+        woken = held and self.asleep  # something began while the robot slept
+        if held != self._held:
+            self._held = held
+            self._last_activity = now  # the count starts again when it ends
+            self._activity.set()
+        if woken:  # at once, so that this state shows it; and said, as every wake is
+            self.asleep = False
+            self.log.info("awake: %s", WakeReason.EVENT.value)
+            self.bus.publish(WakeUp(self.name, WakeReason.EVENT))
         state = ScreenState(
             expression=face.content.expression if face else DEFAULT_EXPRESSION,
             tone=face.content.tone if face else None,
@@ -498,11 +585,14 @@ class ScreenModule(Module):
             battery_low=self._battery_low,
             muted=self._muted,
             panel=self._panel(),
+            asleep=self.asleep,
         )
         if always or state != self.state:
             self.state = state
             await self.screen.show(state)
         self._changed.set()
+        if woken:
+            await self._light()
 
     def _panel(self) -> Panel | None:
         """The panel asked for last, if any."""
@@ -525,6 +615,14 @@ class ScreenModule(Module):
     async def _forward_events(self) -> None:
         while True:
             event = await self.screen.event()
+            if isinstance(event, Opened):
+                if not self.asleep:  # the screen may have turned off before the page held it
+                    await self._light()
+                continue
+            asleep = self.asleep
+            self.bus.publish(WakeUp(self.name, WakeReason.TOUCH))
+            if asleep:  # the tap that wakes the robot does nothing else
+                continue
             if isinstance(event, Touch):
                 self.bus.publish(ScreenTouched(event.x, event.y))
                 self.capabilities.emit(TOUCHED.name, {"x": event.x, "y": event.y})
@@ -534,6 +632,47 @@ class ScreenModule(Module):
                 self.bus.publish(PanelAction(event.panel, event.item, event.value))
             elif isinstance(event, Close):
                 self.bus.publish(PanelClosed(event.panel))
+
+    # ---- sleep ----
+
+    async def _on_wake(self, message: WakeUp) -> None:
+        self._last_activity = self._now()
+        self._activity.set()
+        if not self.asleep:
+            return
+        self.asleep = False
+        self.log.info("awake: %s", message.reason.value)
+        await self._refresh()
+        if message.reason is not WakeReason.TOUCH:  # a touch has lit the screen already
+            await self._light()
+
+    async def _fall_asleep(self) -> None:
+        """Fall asleep once "Sleep after" minutes pass with nothing going on."""
+        while True:
+            self._activity.clear()
+            if self.asleep or self._held or self.sleep_after == NEVER:
+                await self._activity.wait()
+                continue
+            left = self._last_activity + SECONDS_PER_MINUTE * self.sleep_after - self._now()
+            if left > 0:
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(self._activity.wait(), left)
+                continue
+            self.asleep = True
+            self.log.info("asleep after %g minutes with nothing going on", self.sleep_after)
+            await self._refresh()
+
+    async def _light(self) -> None:
+        """Turn the screen on, if the system turned it off."""
+        try:
+            await self.display.wake()
+        except OSError as error:
+            self.log.warning("cannot light the screen: %s", error)
+
+    async def _set_sleep_after(self, minutes: float) -> None:
+        self.sleep_after = minutes  # one of the setting's choices
+        self._last_activity = self._now()
+        self._activity.set()
 
     # ---- what the cloud can ask (``capabilities``) ----
 
@@ -553,7 +692,8 @@ class ScreenModule(Module):
 
     async def _show_scene(self, arguments: Mapping[str, Any]) -> Mapping[str, Any]:
         name = arguments["scene"]
-        scene = None if name is None else Scene(name, arguments.get("data", {}))
+        data = arguments.get("data", {})
+        scene = None if name is None else Scene(name, data, name in self._keeps_awake)
         self.scenes.put(
             CLOUD_SCENE,
             scene,
@@ -572,3 +712,7 @@ class ScreenModule(Module):
     @staticmethod
     def _now() -> float:
         return asyncio.get_running_loop().time()
+
+
+def _minutes(minutes: float) -> str:
+    return f"{minutes:g} minute" + ("" if minutes == 1 else "s")

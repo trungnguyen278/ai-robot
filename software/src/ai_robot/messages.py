@@ -40,6 +40,26 @@ class InteractionChanged(Message):
     state: InteractionState
 
 
+class WakeReason(StrEnum):
+    """What woke the robot (docs/decisions/0021-sleep-and-wake.md)."""
+
+    TOUCH = "touch"  # a tap, a press held or an action on the screen
+    WAKE_WORD = "wake_word"  # its wake word, heard
+    PRESENCE = "presence"  # someone came near, as a camera sees
+    EVENT = "event"  # its own: a timer, an alarm, a reminder, set-up opening
+    APP = "app"  # its owner, from the app
+
+
+@dataclass(frozen=True, slots=True)
+class WakeUp(Message):
+    """Something wakes the robot, or tells it that someone is there: asleep, it wakes;
+    awake, its countdown to sleep starts again. Published by the module that noticed
+    it, read by screen, which decides when the robot sleeps."""
+
+    source: str  # the module's name
+    reason: WakeReason
+
+
 @dataclass(frozen=True, slots=True)
 class SoundLevel(Message):
     """Loudness of the latest microphone chunk. Published by voice."""
@@ -105,6 +125,7 @@ class SceneRequest(Message):
     data: Mapping[str, Any] = field(default_factory=dict)
     priority: int = ScreenPriority.REACTION
     duration: float | None = None  # seconds; None: until replaced or withdrawn
+    keep_awake: bool = False  # something goes on while it shows: the robot stays awake
 
     def __post_init__(self) -> None:
         if self.duration is not None:
@@ -405,6 +426,7 @@ class SettingSection(StrEnum):
 
     NETWORK = "Wi-Fi and app"
     SOUND = "Sound"
+    DISPLAY = "Display"
     LOCALE = "Language and time"
     CLOUD = "What the cloud may do"
     ABOUT = "About"

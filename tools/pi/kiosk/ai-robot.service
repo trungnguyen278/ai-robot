@@ -1,0 +1,14 @@
+# The robot's software, which serves the kiosk's screen. tools/pi/kiosk.sh installs it with
+# the robot's user, its tree and its profile.
+[Unit]
+Description=ai-robot, @PROFILE@ profile
+
+[Service]
+User=@USER@
+WorkingDirectory=@TREE@/software
+ExecStart=@TREE@/software/.venv/bin/ai-robot --profile @PROFILE@
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

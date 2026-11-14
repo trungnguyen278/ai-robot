@@ -41,6 +41,7 @@
     },
     "timer": {
       "description": "A ring that empties as the time runs out; pulses at zero",
+      "keeps_awake": true,
       "data": {
         "ends_at": {"type": "number", "description": "Unix time, in seconds on the software's clock, when it rings"},
         "duration": {"type": "number", "description": "Its length in seconds"},

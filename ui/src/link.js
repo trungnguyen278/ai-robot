@@ -8,13 +8,14 @@
 
 import { EXPRESSIONS } from './expressions.js';
 import { SCENES } from './scenes/index.js';
+import { ASLEEP } from './sleep.js';
 
 export const PROTOCOL = 1;
 
-/** Apply one message from the software to `player` (player.js) and, if there is one,
-    `panel` (panel.js). Returns whether the message was understood; unknown types and
-    fields are ignored, as the protocol requires. */
-export function apply(message, player, panel = null) {
+/** Apply one message from the software to `player` (player.js) and, if there are
+    ones, `panel` (panel.js) and `sleep` (sleep.js). Returns whether the message was
+    understood; unknown types and fields are ignored, as the protocol requires. */
+export function apply(message, player, panel = null, sleep = null) {
   const animator = player.animator;
   // The software's clock, so that the times it sends (a timer's end) read right.
   if (Number.isFinite(message?.time)) player.offset = message.time - Date.now() / 1000;
@@ -26,16 +27,23 @@ export function apply(message, player, panel = null) {
       const status = message.status ?? {};
       const scene = message.scene ?? null;
       const expression = typeof face.expression === 'string' ? face.expression : '';
-      animator.set(expression, typeof face.tone === 'string' ? face.tone : null, player.now());
+      // Asleep, the face is sleep's, and no scene or panel shows.
+      const asleep = message.asleep === true;
+      if (sleep ? !sleep.follow(asleep) : !asleep) {
+        animator.set(expression, typeof face.tone === 'string' ? face.tone : null, player.now());
+      } else if (!sleep) {
+        animator.set(ASLEEP, null, player.now());
+      }
       const data = scene && typeof scene.data === 'object' && scene.data !== null ? scene.data : {};
-      animator.setScene(scene && typeof scene.name === 'string' ? scene.name : null, data, player.now());
+      const name = !asleep && scene && typeof scene.name === 'string' ? scene.name : null;
+      animator.setScene(name, data, player.now());
       player.status = {
         battery: Number.isFinite(status.battery) ? status.battery : null,
         charging: typeof status.charging === 'boolean' ? status.charging : null,
         low: typeof status.low === 'boolean' ? status.low : null,
         muted: typeof status.muted === 'boolean' ? status.muted : null,
       };
-      panel?.show(message.panel ?? null);
+      panel?.show(asleep ? null : message.panel ?? null);
       return true;
     }
     case 'look': {
@@ -58,10 +66,14 @@ export function defaultUrl() {
 }
 
 export class Link {
-  /** `panel` draws the panels (panel.js), if this page shows them. */
-  constructor(player, { url = defaultUrl(), panel = null, onChange = () => {}, reload = () => location.reload() } = {}) {
+  /** `panel` draws the panels (panel.js), if this page shows them; `sleep` (sleep.js)
+      keeps the screen on while the robot is awake, if this page is its screen. */
+  constructor(player, {
+    url = defaultUrl(), panel = null, sleep = null, onChange = () => {}, reload = () => location.reload(),
+  } = {}) {
     this.player = player;
     this.panel = panel;
+    this.sleep = sleep;
     this.url = url;
     this.onChange = onChange;
     this.reload = reload;
@@ -89,16 +101,7 @@ export class Link {
         scenes: Object.keys(SCENES),
       });
     };
-    socket.onmessage = (event) => {
-      let message;
-      try {
-        message = JSON.parse(event.data);
-      } catch {
-        return;
-      }
-      if (message?.type === 'hello') this.hello(message);
-      apply(message, this.player, this.panel);
-    };
+    socket.onmessage = (event) => this.receive(event.data);
     socket.onclose = () => {
       // Nothing done on a panel would reach the robot: it goes, and the state sent on
       // reconnection brings it back if it is still open.
@@ -109,6 +112,18 @@ export class Link {
       this.delay = Math.min(this.delay * 2, 5);
     };
     socket.onerror = () => socket.close();
+  }
+
+  /** Take one message from the software, as text; one that is not JSON is ignored. */
+  receive(text) {
+    let message;
+    try {
+      message = JSON.parse(text);
+    } catch {
+      return;
+    }
+    if (message?.type === 'hello') this.hello(message);
+    apply(message, this.player, this.panel, this.sleep);
   }
 
   /** Check the software's greeting: its protocol, and the revision of the files it

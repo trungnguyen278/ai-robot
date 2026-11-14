@@ -30,6 +30,7 @@
   import { Press } from './src/press.js';
   import { SCENES } from './src/scenes/index.js';
   import { SETTINGS } from './src/settings.js';
+  import { Sleep } from './src/sleep.js';
 
   const canvas = document.getElementById('screen');
   const offline = document.getElementById('offline');
@@ -52,6 +53,8 @@
   let timer = setTimeout(() => { offline.hidden = false; }, 2000);
   const link = new Link(player, {
     panel,
+    // The robot's sleep: this page keeps the screen on while the robot is awake.
+    sleep: new Sleep(player, SETTINGS.sleep),
     onChange(connected) {
       clearTimeout(timer);
       if (connected) offline.hidden = true;

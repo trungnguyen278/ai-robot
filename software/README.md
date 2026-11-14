@@ -21,7 +21,7 @@ Python 3.11 or later (asyncio), with an optional C++ extension. Runtime dependen
 modules    system · settings · motion · voice · vision · screen · setup · cloud · behavior
              │  talk to each other only through messages on the bus
              │  each one owns some ports
-ports      audio_in · audio_out · wake_word · voice_activity · camera · screen
+ports      audio_in · audio_out · wake_word · voice_activity · camera · screen · display_power
            setup_link · network · cloud · identity · binding · settings · daylight · time_zone
            drive · joints · range · power · lights · safety
              │  implemented by
@@ -34,7 +34,7 @@ adapters   sim (any computer, CI)  |  real (on the robot), chosen per profile
 | `motion` | `drive`, `joints`, `range`, `safety` | Tracks, neck and arms; obstacle and emergency-stop checks |
 | `voice` | `audio_in`, `audio_out`, `wake_word`, `voice_activity` | Conversations with the cloud: the wake word opens them, the robot streams what it hears and plays the answers, barge-in, the limits that end them; where the conversation is (the interaction state). The voice processor cancels the echo ([ADR-0011](../docs/decisions/0011-audio-voice-processor.md), [ADR-0013](../docs/decisions/0013-listening-on-the-robot.md), [ADR-0018](../docs/decisions/0018-conversations.md)) |
 | `vision` | `camera` | People and object detection, face tracking |
-| `screen` | `screen` | What the screen shows: the expression and the scene asked with the highest priority, the gaze, the voice, the battery and whether the microphones are off; panels over the face, such as the settings; taps and holds |
+| `screen` | `screen`, `display_power` | What the screen shows: the expression and the scene asked with the highest priority, the gaze, the voice, the battery and whether the microphones are off; panels over the face, such as the settings; taps and holds; when the robot sleeps, and lighting a dark screen when it wakes ([ADR-0021](../docs/decisions/0021-sleep-and-wake.md)) |
 | `settings` | `settings` | The owner's settings: what the modules offer, shown as one panel on the screen; what the owner chose, kept, and handed to their modules before they run ([ADR-0016](../docs/decisions/0016-settings.md)) |
 | `setup` | `setup_link`, `network` | Set-up with the owner's app over Bluetooth LE: when it opens, the code on the screen, the session, the Wi-Fi network ([set-up](https://github.com/trungnguyen278/ai-platform/blob/main/protocols/setup/README.md), in ai-platform) |
 | `cloud` | `cloud`, `identity`, `binding` | The link to `ai-cloud`, which the robot's identity proves: the cloud calls the capabilities the modules offer, and hears the events they declare; it tells the cloud the robot's languages and time zone, which `system` gives, and carries conversations, turns and answers with their audio, for `voice` ([the cloud link](https://github.com/trungnguyen278/ai-platform/blob/main/protocols/cloud/README.md), in ai-platform). It signs the robot's registration at set-up, and keeps whether the robot is bound. Its settings say what the cloud may do, by safety class |
@@ -64,7 +64,7 @@ software/
 │   ├── native.py           C++ functions, with pure-Python fallbacks
 │   ├── core/               Configuration, bus, module base class, factory
 │   ├── ports/              Port interfaces
-│   ├── adapters/           Adapter registry; sim/ (simulated), portaudio/ (microphones and speaker), microwakeword/ (wake words), silero/ (voice), web/ (aiohttp: the screen served to a browser), websocket/ (the link to the cloud), keys/ (keys kept in software), tpm/ (keys in the robot's TPM), files/ (state kept in files), bluez/ (Bluetooth LE), networkmanager/ (Wi-Fi), sun/ (sunrise and sunset)
+│   ├── adapters/           Adapter registry; sim/ (simulated), portaudio/ (microphones and speaker), microwakeword/ (wake words), silero/ (voice), web/ (aiohttp: the screen served to a browser), websocket/ (the link to the cloud), keys/ (keys kept in software), tpm/ (keys in the robot's TPM), files/ (state kept in files), bluez/ (Bluetooth LE), networkmanager/ (Wi-Fi), sun/ (sunrise and sunset), wake/ (ai-robot-wake, which lights the kiosk's screen, and the robot's client of it)
 │   └── modules/            Module registry and the modules
 ├── native/                 Optional C++ extension (pybind11 + scikit-build-core)
 └── tests/
@@ -124,6 +124,11 @@ Install with `-e` from this checkout, cloned with its submodule (`git clone --re
 ### The screen
 
 While the robot runs, its screen is at <http://127.0.0.1:8770/>: open it in a browser to watch the face follow the robot. On the robot, Chromium shows that page full screen (kiosk mode). The page is the renderer in [`ui/`](../ui/README.md); the `screen` module decides what it shows, over the [screen protocol](../protocol/screen/README.md).
+
+The robot sleeps after "Sleep after" minutes with nothing going on, a setting of the screen's (1, 2, 5, 10 or 30 minutes, or never; 5 as shipped). Its face grows sleepy and closes its eyes, and then the kiosk turns the screen off ([ADR-0021](../docs/decisions/0021-sleep-and-wake.md)):
+- **Nothing counts** during a conversation, while a scene that keeps the robot awake shows (set-up's, the timer), or while a panel is open.
+- **It wakes** on a `WakeUp` message, which every wake source publishes: a touch, its wake word, its own events, and later a person seen by the camera and the owner's app. The tap that wakes it does nothing else.
+- **A dark screen is lit** through the `display_power` port: the `helper` adapter asks `ai-robot-wake`, which [`tools/pi/kiosk.sh`](../tools/pi/README.md#the-kiosk) installs, and `sim` lights nothing.
 
 ### Voice
 
