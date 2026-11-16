@@ -77,6 +77,7 @@ from ai_robot.ports.screen import (
     ScreenEvent,
     ScreenState,
     Touch,
+    Woken,
 )
 from ai_robot.ports.settings import SettingsStore
 from ai_robot.ports.setup import Connected, Disconnected, LinkEvent, Received, SetupLink
@@ -184,4 +185,5 @@ __all__ = [
     "VoiceActivity",
     "WakeWord",
     "WifiNetwork",
+    "Woken",
 ]

@@ -167,7 +167,7 @@ def test_a_tap_wakes_it_without_lighting_the_screen_and_does_nothing_else() -> N
     asyncio.run(main())
 
 
-@pytest.mark.parametrize("kind", ["hold", "act", "close_panel"])
+@pytest.mark.parametrize("kind", ["hold", "act", "close_panel", "wake"])
 def test_each_thing_done_on_the_screen_wakes_it(kind: str) -> None:
     async def main() -> None:
         async with running(Robot()) as robot:
@@ -176,9 +176,12 @@ def test_each_thing_done_on_the_screen_wakes_it(kind: str) -> None:
                 robot.screen.hold(0.5, 0.5)
             elif kind == "act":
                 robot.screen.act("settings", "voice.volume", 50)
+            elif kind == "wake":
+                robot.screen.wake()  # a touch on the dark screen, which a key lit
             else:
                 robot.screen.close_panel("settings")
             await until(lambda: not robot.asleep)
+            assert robot.wakes == 0  # lit already
 
     asyncio.run(main())
 

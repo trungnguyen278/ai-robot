@@ -81,6 +81,8 @@
       if (event.isPrimary) press.up();
     });
   }
+  // A touch on the dark screen reaches the page as the wake key alone (ADR-0021).
+  window.addEventListener('keydown', (event) => link.key(event.code));
   // A long press on a touch screen would open the browser's menu.
   canvas.addEventListener('contextmenu', (event) => event.preventDefault());
 </script>

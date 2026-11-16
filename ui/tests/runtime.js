@@ -442,11 +442,18 @@ function checkProtocol() {
   const sent = [];
   link.socket = { readyState: WebSocket.OPEN, send: (text) => sent.push(JSON.parse(text)) };
   link.hold(0.5, 0.25);
+  link.key('WakeUp'); // with no sleep to follow
+  link.sleep = { asleep: false };
+  link.key('WakeUp'); // the robot lit the screen
+  link.sleep = { asleep: true };
+  link.key('KeyA');
+  link.key('WakeUp'); // a touch lit it
   link.action('settings', 'voice.volume', 60);
   link.action('settings', 'setup.start');
   link.close('settings');
   check(same(sent, [
     { type: 'hold', x: 0.5, y: 0.25 },
+    { type: 'wake' },
     { type: 'action', panel: 'settings', item: 'voice.volume', value: 60 },
     { type: 'action', panel: 'settings', item: 'setup.start' },
     { type: 'close', panel: 'settings' },

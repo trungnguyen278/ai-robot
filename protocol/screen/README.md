@@ -83,7 +83,7 @@ The software decides when the robot sleeps, and says so with `asleep` ([ADR-0021
 - While asleep, `face`, `scene` and `panel` are kept but not shown.
 - When `asleep` turns `false`, the face, scene and panel show again, and the lock is held again.
 
-A tap on a sleeping robot only wakes it: the software does not act on it. The software also lights a dark screen itself when the robot wakes from anything else, such as its wake word, and when a page sends `ready` while the robot is awake.
+A tap on a sleeping robot only wakes it: the software does not act on it. A tap on a dark screen does not reach the page at all: the robot's kiosk lights the screen with a key instead, and the page reports it as `wake`. The software also lights a dark screen itself when the robot wakes from anything else, such as its wake word, and when a page sends `ready` while the robot is awake.
 
 ### Panels
 
@@ -171,6 +171,14 @@ A press held still on the face for the renderer's hold time (3 s as shipped), wh
 
 ```json
 {"type": "hold", "x": 0.42, "y": 0.61}
+```
+
+### `wake`
+
+A touch lit the dark screen, while the robot sleeps. The robot's compositor passes on no touch from a screen that is off, so the kiosk presses the key that lights it, and the page reports that key (`KeyboardEvent.code` `"WakeUp"`) instead of a `touch` ([ADR-0021](../../docs/decisions/0021-sleep-and-wake.md)). The robot wakes as from a tap, and does nothing else. A renderer sends it only while `asleep` is `true`: awake, the software lit the screen itself.
+
+```json
+{"type": "wake"}
 ```
 
 ### `action`

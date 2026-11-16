@@ -1,6 +1,8 @@
-# ai-robot-wake, the helper that lights the screen for the robot: it presses KEY_WAKEUP on a
-# uinput keyboard that has no other key (docs/decisions/0021-sleep-and-wake.md). It runs as a
-# user of its own with the uinput group only, and may touch no device but /dev/uinput.
+# ai-robot-wake, the helper that lights the screen for the robot, and for a touch on the dark
+# screen: it presses KEY_WAKEUP on a uinput keyboard that has no other key
+# (docs/decisions/0021-sleep-and-wake.md). It runs as a user of its own with the uinput group,
+# and the touchscreen group, which may read the touch screens and no other input device. It may
+# write to no device but /dev/uinput, and read none but the input devices.
 # tools/pi/kiosk.sh installs it, with its program copied from the robot's tree to
 # /usr/local/libexec, where only root may change it.
 [Unit]
@@ -13,14 +15,19 @@ After=ai-robot-wake.socket
 # --settle: seconds between creating the keyboard and the first press, for the compositor to
 #   take the new keyboard up.
 # --read-timeout: seconds a connection may take to send its request.
-ExecStart=/usr/bin/python3 -I /usr/local/libexec/ai-robot-wake --interval 1 --settle 0.5 --read-timeout 1
+# --touchscreens: the folder of the input devices, whose touch screens it watches.
+# --displays: the folder of the display connectors, which say whether the screen is on.
+# --rescan: seconds between looks for a touch screen that came, or came back, as when USB
+#   enumerates it again.
+ExecStart=/usr/bin/python3 -I /usr/local/libexec/ai-robot-wake --interval 1 --settle 0.5 --read-timeout 1 --touchscreens /dev/input --displays /sys/class/drm --rescan 2
 Restart=on-failure
 RestartSec=5
 
 DynamicUser=yes
-SupplementaryGroups=uinput
+SupplementaryGroups=uinput touchscreen
 DevicePolicy=closed
 DeviceAllow=/dev/uinput w
+DeviceAllow=char-input r
 CapabilityBoundingSet=
 NoNewPrivileges=yes
 PrivateNetwork=yes
