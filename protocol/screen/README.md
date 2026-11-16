@@ -42,6 +42,7 @@ What to show. Sent on connection and on every change, with the software's `time`
  "scene": {"name": "weather", "data": {"condition": "rain", "temperature": 18}},
  "status": {"battery": 82.0, "charging": false, "low": false, "muted": false},
  "panel": null,
+ "asleep": false,
  "time": 1792130401.5}
 ```
 
@@ -55,6 +56,7 @@ What to show. Sent on connection and on every change, with the software's `time`
 | `status.low` | `true` when the robot judges the battery low (the renderer shows it in red), `false`, or `null` if unknown. Optional: a missing field means `null`. The robot decides, by its own threshold; the renderer has none. |
 | `status.muted` | `true` while the microphones are off: the status row shows it. `false`, or `null` if unknown. Optional: a missing field means `null`. |
 | `panel` | An interactive panel over the face, such as the settings ([Panels](#panels)), or `null` for none. Optional: a missing field means `null`. |
+| `asleep` | `true` while the robot sleeps ([Sleep](#sleep)), else `false`. Optional: a missing field means `false`. |
 
 The scenes and their data:
 
@@ -68,7 +70,20 @@ The scenes and their data:
 
 A scene marked `robot_only` in the vocabulary, `setup`, is the robot's own: the cloud cannot ask for it, so that a set-up code on the screen is always the robot's.
 
+A scene with `keeps_awake_until` in the vocabulary, `timer`, keeps the robot awake while it shows, as something going on, until the time in the field of its data that `keeps_awake_until` names: the timer's `ends_at`, when it rings. The software does not put the robot to sleep under it before then, and counts from then on: a timer left ringing lets the robot sleep a whole "Sleep after" later. A scene whose field is missing, is not a number, or names a time passed, does not keep the robot awake.
+
 A renderer draws a scene even with missing or malformed data, with placeholders (a timer without `ends_at` shows `--:--`). A scene asked for again with new data is updated in place, without starting over.
+
+### Sleep
+
+The software decides when the robot sleeps, and says so with `asleep` ([ADR-0021](../../docs/decisions/0021-sleep-and-wake.md)).
+
+- While `asleep` is `false`, a renderer that is the robot's screen holds a [Screen Wake Lock](https://www.w3.org/TR/screen-wake-lock/), so that the system keeps the screen on. It asks for it again whenever the page shows again.
+- When `asleep` turns `true`, the face grows sleepy and then closes its eyes, with an expression of the renderer's own (`asleep`, outside the vocabulary). Then the renderer releases the lock, and the system turns the screen off a while later.
+- While asleep, `face`, `scene` and `panel` are kept but not shown.
+- When `asleep` turns `false`, the face, scene and panel show again, and the lock is held again.
+
+A tap on a sleeping robot only wakes it: the software does not act on it. The software also lights a dark screen itself when the robot wakes from anything else, such as its wake word, and when a page sends `ready` while the robot is awake.
 
 ### Panels
 

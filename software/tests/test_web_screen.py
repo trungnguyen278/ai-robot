@@ -16,7 +16,17 @@ import aiohttp
 import pytest
 
 from ai_robot.adapters.web.screen import PROTOCOL, WebScreen, panel_message
-from ai_robot.ports import Action, Close, Hold, Panel, PanelItem, PanelSection, ScreenState, Touch
+from ai_robot.ports import (
+    Action,
+    Close,
+    Hold,
+    Opened,
+    Panel,
+    PanelItem,
+    PanelSection,
+    ScreenState,
+    Touch,
+)
 
 VOCABULARY = Path(__file__).resolve().parents[2] / "protocol" / "screen" / "vocabulary.json"
 TIMEOUT = 2.0
@@ -108,10 +118,12 @@ def test_serves_the_renderer_and_drives_its_pages(ui_dir: Path) -> None:
                     "scene": None,
                     "status": {"battery": 50.0, "charging": False, "low": False, "muted": None},
                     "panel": None,
+                    "asleep": False,
                 }
                 assert await receive(page) == {"type": "look", "target": None}
 
                 await page.send_json(ready(expressions=["neutral", "happy"], scenes=["clock"]))
+                assert await asyncio.wait_for(screen.event(), TIMEOUT) == Opened()
                 await page.send_json({"type": "touch", "x": 0.25, "y": 0.75})
                 assert await asyncio.wait_for(screen.event(), TIMEOUT) == Touch(0.25, 0.75)
 
@@ -124,6 +136,8 @@ def test_serves_the_renderer_and_drives_its_pages(ui_dir: Path) -> None:
                 data = {"condition": "rain", "days": [18, {"high": 19}]}
                 await screen.show(ScreenState(scene="weather", scene_data=data))
                 assert (await receive_state(page))["scene"] == {"name": "weather", "data": data}
+                await screen.show(ScreenState(asleep=True))
+                assert (await receive_state(page))["asleep"] is True
 
     asyncio.run(main())
 
@@ -152,8 +166,7 @@ def test_warns_about_names_no_page_knows(ui_dir: Path, caplog: pytest.LogCapture
                 for _ in range(3):
                     await receive(page)
                 await page.send_json(ready(expressions=["neutral"]))  # an older page: no scenes
-                await page.send_json({"type": "touch", "x": 0, "y": 0})
-                await asyncio.wait_for(screen.event(), TIMEOUT)  # "ready" was handled
+                assert await asyncio.wait_for(screen.event(), TIMEOUT) == Opened()  # handled
                 for _ in range(2):
                     await screen.show(ScreenState(expression="sad", scene="clock"))
                     await receive(page)

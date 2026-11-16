@@ -42,3 +42,7 @@ adapter = "file"
 # Its time zone: the system's, which the app sets at set-up.
 [ports.time_zone]
 adapter = "timedated"
+
+# Its screen lit by the kiosk's helper (tools/pi/README.md, docs/decisions/0021).
+[ports.display_power]
+adapter = "helper"

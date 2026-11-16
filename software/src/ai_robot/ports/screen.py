@@ -121,7 +121,8 @@ class ScreenState:
     ``battery`` (percent) and ``charging`` fill the status row, ``battery_low`` shows the
     battery in red (the robot's judgement, from system), and ``muted`` that the
     microphones are off; ``None`` means unknown. ``panel`` is shown over the face, or
-    is ``None``.
+    is ``None``. ``asleep``: the robot sleeps, so the face falls asleep and the screen
+    may turn off (docs/decisions/0021-sleep-and-wake.md); awake, the screen stays on.
     """
 
     expression: str = "neutral"
@@ -133,6 +134,7 @@ class ScreenState:
     battery_low: bool | None = None
     muted: bool | None = None
     panel: Panel | None = None
+    asleep: bool = False
 
     def __post_init__(self) -> None:
         if self.battery is not None and not (
@@ -175,7 +177,12 @@ class Close:
     panel: str
 
 
-ScreenEvent = Touch | Hold | Action | Close
+@dataclass(frozen=True, slots=True)
+class Opened:
+    """A page that shows the face has connected, and is ready."""
+
+
+ScreenEvent = Touch | Hold | Action | Close | Opened
 
 
 class Screen(Port):
@@ -206,4 +213,4 @@ class Screen(Port):
     @abstractmethod
     async def event(self) -> ScreenEvent:
         """Wait for the next thing someone does on the screen: a tap, a press held, or
-        an action on a panel or its closing."""
+        an action on a panel or its closing; or for a page that opened."""

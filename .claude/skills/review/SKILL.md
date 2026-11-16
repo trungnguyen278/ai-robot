@@ -50,6 +50,8 @@ A failing check is a finding; fix it before reading further.
 - Each concern lives with its owner (power with `system`, what is shown with `screen`); a module does not grow change detectors for another module's data.
 - Messages are frozen dataclasses; mutable fields are deep, read-only copies; checks use `core/checks.py`.
 - Hardware values come from the configuration, with no defaults in code.
+- Every hold ends: whatever keeps the robot awake, or a resource held, has an end that comes on its own (an expiry, a time in the data, a grace period), or one that a test shows is always sent. A timer shown without `seconds` once kept the robot awake for good, past its `ends_at`.
+- What a protocol file says applies on every path that shows it: a module's request and the cloud's alike. The vocabulary's flags were read on the cloud's path only.
 - A file descriptor has one owner, and every path closes it. One passed over D-Bus is closed once the message has gone: dbus-fast keeps no copy, and only a bus made with `negotiate_unix_fd=True` passes it at all. A socket the event loop reads or writes (`add_reader`, `sock_sendall`) is non-blocking, which asyncio's debug mode checks. A test counts the open descriptors (`/proc/self/fd`).
 
 ### Renderer (`ui/src/`)
@@ -60,17 +62,25 @@ A failing check is a finding; fix it before reading further.
 - Text is measured with the font it is drawn with (`text.js`) and cut by characters (`clip`), not by UTF-16 units.
 - The glow is costly: static shapes go through `cached()` (`scenes/kit.js`); look for blurred shapes redrawn every frame.
 - Modules keep to the import and export forms `ui/tools/single_file.py` lists.
+- What the page holds for the robot (a wake lock, a panel) goes when its link does, at once or after a grace period: a page that lost its link kept the screen lit for good.
 
 ### System services and the Pi's set-up (`adapters/`, `tools/pi/`)
 
 - A change that relies on how a system service behaves (BlueZ, NetworkManager) is checked against the version Ubuntu 26.04 ships, with Ubuntu's patches, not against upstream's newest. It runs on the Pi with as many clients as the feature serves: the fakes model the documented behaviour, not a version's bugs. Two apps at once found that BlueZ 5.85 closed one app's channel when the other left (ADR-0020).
 - A D-Bus signal counts only when its sender is the service's current unique name (`Owner.sent`, `adapters/dbus.py`): a match rule's `sender` filters broadcasts only, and the system bus lets any connection send a signal to the robot alone. The owner is followed through `NameOwnerChanged`, so the robot recovers when the service restarts instead of being restarted with it.
 - Set-up scripts in `tools/pi/` ask for no root: they print the root commands, which the README lists too.
+- A web API that needs the compositor fails silently where the compositor does not offer the protocol. Chromium granted a Screen Wake Lock while Frame offered no `zwp_idle_inhibit_manager_v1`, and the screen turned off anyway (ADR-0021). Check on the Pi that the compositor lists the global, and that the effect happens.
+- A group is a privilege. `uinput` creates input devices and `input` writes events into existing ones (`evdev_write`), so either lets a user type into the kiosk's Chromium, which runs as root. A service gets only the groups it needs (`SupplementaryGroups=`), and `systemd-analyze security` scores its unit.
+- What root runs comes from a copy that only root may change, never from the robot's tree, which the robot's user can edit.
+- A snap's daemon restarts only on failure (`Restart=on-failure`). One that exits with status 0, as Chromium does when Frame goes away, stays down unless a drop-in says otherwise.
+- A unit tied to another follows every way the other one goes: a restart, a stop, and a stop then a start, which is how snapd refreshes a snap. `PartOf=` passes stops and restarts but never a start, and systemd does not restart a unit that a job stopped (`Restart=`), so the other unit must want it (`Wants=`, in a drop-in on its unit).
+- Leaving a group (`gpasswd --delete`) reaches no process already running: a login reads its groups once (initgroups(3)), and its processes, the user's systemd manager among them, keep them until they end. A set-up that removes a group says to end the user's sessions, and its check reads `/proc/*/status`.
 
 ### Tests
 
 - Each behaviour change has a test that would fail on the old code; check it is not vacuous (an exact float compare that never matches, a loop that never runs).
 - No fixed sleeps to wait for readiness: wait for the condition, with a timeout.
+- A test that a delay did not end early allows a wide margin, half the delay: on Windows a 0.108 s wait measured 0.093 s.
 
 ### Duplication
 

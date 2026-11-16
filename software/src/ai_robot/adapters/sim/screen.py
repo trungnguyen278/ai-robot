@@ -6,7 +6,16 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from ai_robot.ports.screen import Action, Close, Hold, Screen, ScreenEvent, ScreenState, Touch
+from ai_robot.ports.screen import (
+    Action,
+    Close,
+    Hold,
+    Opened,
+    Screen,
+    ScreenEvent,
+    ScreenState,
+    Touch,
+)
 
 
 class SimScreen(Screen):
@@ -47,3 +56,7 @@ class SimScreen(Screen):
     def close_panel(self, panel: str) -> None:
         """Simulate the owner closing ``panel``."""
         self._events.put_nowait(Close(panel))
+
+    def open_page(self) -> None:
+        """Simulate a page that shows the face connecting."""
+        self._events.put_nowait(Opened())

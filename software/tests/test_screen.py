@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+from ai_robot.adapters.sim.display_power import SimDisplayPower
 from ai_robot.adapters.sim.screen import SimScreen
 from ai_robot.core.bus import Bus
 from ai_robot.core.config import ConfigError
@@ -52,6 +53,8 @@ SCREEN = {
     "reaction_seconds": 3.0,
     "reaction_max_seconds": 30.0,
     "scene_max_seconds": 86400.0,
+    "sleep_after": 5,
+    "sleep_choices": [1, 2, 5, 10, 30],
 }
 
 
@@ -59,7 +62,7 @@ def context(bus: Bus, screen: SimScreen) -> ModuleContext:
     return ModuleContext(
         name="screen",
         bus=bus,
-        ports={"screen": screen},
+        ports={"screen": screen, "display_power": SimDisplayPower()},
         robot=RobotInfo(display_name="Robot", kind="robot", model="concept-v0"),
         log=logging.getLogger("test"),
     )

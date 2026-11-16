@@ -17,6 +17,7 @@ adapters is selected:
 - ``networkmanager/``, with dbus-fast: the robot's Wi-Fi (Linux);
 - ``timedated/``, with dbus-fast: the robot's time zone (Linux);
 - ``sun/``: sunrise and sunset;
+- ``wake/``: the screen woken by the kiosk's helper, ``ai-robot-wake`` (Linux);
 - later, Picamera2 or the body link.
 """
 
@@ -80,6 +81,10 @@ ADAPTERS: dict[str, dict[str, str]] = {
     "daylight": {
         "fixed": "ai_robot.adapters.sun.daylight:FixedDaylight",
         "solar": "ai_robot.adapters.sun.daylight:SolarDaylight",
+    },
+    "display_power": {
+        "sim": "ai_robot.adapters.sim.display_power:SimDisplayPower",
+        "helper": "ai_robot.adapters.wake.client:HelperDisplayPower",
     },
     "time_zone": {
         "sim": "ai_robot.adapters.sim.time_zone:SimTimeZone",

@@ -15,6 +15,11 @@
 # [ports.screen.web]
 # host = "0.0.0.0"
 
+# Light the kiosk's screen through its helper with a profile other than pi, such as
+# desktop on a Pi without the robot's hardware (tools/pi/README.md, "The kiosk"):
+# [ports.display_power]
+# adapter = "helper"
+
 # Sunrise and sunset computed for where the robot is: latitude and longitude in
 # degrees, north and east positive. They stay on this machine.
 # [ports.daylight]
