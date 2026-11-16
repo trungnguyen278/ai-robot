@@ -32,6 +32,7 @@ from ai_robot.ports.screen import (
     ScreenEvent,
     ScreenState,
     Touch,
+    Woken,
 )
 
 log = logging.getLogger(__name__)
@@ -275,6 +276,8 @@ class WebScreen(Screen):
                 self._events.put_nowait(Close(message["panel"]))
             else:
                 log.warning("screen page closed no panel: %r", message)
+        elif kind == "wake":
+            self._events.put_nowait(Woken())
 
     def _check_names(self) -> None:
         """Warn once per name about an expression or a scene no ready page knows. A

@@ -75,7 +75,8 @@ The script asks for no root and nothing of the machine but apt's sources and the
 The robot's screen is a kiosk: Ubuntu Frame (the `ubuntu-frame` snap) shows Chromium (the `chromium` snap, run as its daemon), which opens the page the robot's software serves. The screen sleeps and wakes with the robot ([ADR-0021](../../docs/decisions/0021-sleep-and-wake.md)):
 - while the robot is awake, the page holds a Screen Wake Lock, and Frame keeps the screen on;
 - once the robot sleeps and its face has closed its eyes, the page lets the lock go, and Frame turns the screen off 15 s later (`idle-timeout`). The page lets it go too once its link to the robot has been down for a while (`ui/src/settings.js`), and a touch still lights the screen;
-- when the robot wakes, the software asks `ai-robot-wake` to light the screen. That helper presses `KEY_WAKEUP` on a keyboard of its own, which has no other key, at most once a second.
+- when the robot wakes, the software asks `ai-robot-wake` to light the screen. That helper presses `KEY_WAKEUP` on a keyboard of its own, which has no other key, at most once a second;
+- a touch on the dark screen lights it too. Mir passes on no touch from a screen that is off, so the helper reads the touch screens, and presses the key when a touch begins while no display is on. The page reports the key to the robot, which wakes as from a tap.
 
 [`kiosk.sh`](kiosk.sh) sets all of this up from the files in [`kiosk/`](kiosk/):
 
@@ -86,8 +87,9 @@ The robot's screen is a kiosk: Ubuntu Frame (the `ubuntu-frame` snap) shows Chro
 | `frame-daemon.conf` | a drop-in for `snap.ubuntu-frame.daemon.service` | Chromium starts whenever Frame starts, as when snapd stops and starts Frame to refresh it: systemd passes a stop or a restart on to Chromium, never a start |
 | `ai-robot.service` | `/etc/systemd/system/` | the robot's software, as its user, from this tree, with the profile given |
 | `ai-robot-wake.socket` | `/etc/systemd/system/` | the helper's socket, at the robot's `[ports.display_power.helper] path`, for root and the robot's group only |
-| `ai-robot-wake.service` | `/etc/systemd/system/` | the helper, as a dynamic user with the `uinput` group only, allowed no device but `/dev/uinput`; its program is copied to `/usr/local/libexec/ai-robot-wake`, where only root may change it |
+| `ai-robot-wake.service` | `/etc/systemd/system/` | the helper, as a dynamic user with the `uinput` and `touchscreen` groups only, allowed to write to no device but `/dev/uinput` and to read none but the input devices; its program is copied to `/usr/local/libexec/ai-robot-wake`, where only root may change it |
 | `70-ai-robot-uinput.rules` | `/etc/udev/rules.d/` | `/dev/uinput` for root and the `uinput` group |
+| `70-ai-robot-touchscreen.rules` | `/etc/udev/rules.d/` | the touch screens for root, and for the `touchscreen` group to read |
 
 The robot's own user leaves the `uinput` and `input` groups, if it was in them: with either, it could type into the kiosk's Chromium, which runs as root without its sandbox.
 
@@ -115,7 +117,7 @@ tools/pi/kiosk.sh install pi ~/kiosk
 It asks for no root:
 - it reads the screen's port and the helper's socket from the profile's configuration;
 - it writes the files above into the folder, laid out as they go on the machine (`etc/`, `usr/`), and Frame's config option beside them;
-- it prints the root commands that install them, remove the robot's user from the two groups, and restart the helper, the robot, Frame and Chromium;
+- it prints the root commands that create the helper's groups, install the files, apply the udev rules, remove the robot's user from `uinput` and `input`, and restart the helper, the robot, Frame and Chromium;
 - when the robot's user was in either group, or a process of it still holds one, it prints a last step: end that user's sessions, with `loginctl terminate-user`, or reboot.
 
 Run those commands as root, in their order. Changing Frame's config restarts Frame (its configure hook), and Chromium with it.
@@ -131,7 +133,7 @@ tools/pi/kiosk.sh check pi
 It says what differs from what `install` sets up, and exits with status 1 if anything does:
 - Frame's config, as Frame's own config file holds it, and the page that Chromium shows, from its command line;
 - each installed file, and the helper's copy, against this tree's;
-- the groups of the robot's user, and whether any of its processes still holds one; `/dev/uinput`'s owner and mode;
+- the groups of the robot's user, and whether any of its processes still holds one; the owner and mode of `/dev/uinput` and of each touch screen;
 - whether the units run and start at boot.
 
 Run it again after pulling a change to `tools/pi/kiosk/` or to the helper, and `install` again if it reports one. It needs no root either.

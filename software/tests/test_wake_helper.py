@@ -10,7 +10,8 @@ import os
 import socket
 import struct
 import threading
-from collections.abc import Iterator
+import time
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -102,8 +103,25 @@ def test_a_keyboard_that_cannot_be_made_closes_its_file(uinput: FakeUinput) -> N
     assert uinput.calls[-1] == ("close", 42)
 
 
+class Displays:
+    """Stands in for the displays: whether the screen is dark, and how often it was asked."""
+
+    def __init__(self) -> None:
+        self.dark = True
+        self.asked = 0
+
+    def __call__(self) -> bool:
+        self.asked += 1
+        return self.dark
+
+
 @contextlib.contextmanager
-def serving(tmp_path: Path, clock: list[float] | None = None) -> Iterator[tuple[str, list[str]]]:
+def serving(
+    tmp_path: Path,
+    clock: list[float] | None = None,
+    touchscreens: helper.Touchscreens | None = None,
+    displays: Displays | None = None,
+) -> Iterator[tuple[str, list[str]]]:
     """The helper serving on a socket in ``tmp_path``; what it pressed, and the path."""
     path = str(tmp_path / "wake.sock")
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -114,15 +132,21 @@ def serving(tmp_path: Path, clock: list[float] | None = None) -> Iterator[tuple[
     thread = threading.Thread(
         target=helper.serve,
         args=(listener, lambda: presses.append("wake")),
-        kwargs={"interval": 1.0, "read_timeout": 0.5, "clock": lambda: now[0]},
+        kwargs={
+            "interval": 1.0,
+            "read_timeout": 0.5,
+            "dark": displays if displays is not None else Displays(),
+            "touchscreens": touchscreens,
+            "clock": lambda: now[0],
+        },
     )
     thread.start()
     try:
         yield path, presses
     finally:
-        listener.shutdown(socket.SHUT_RDWR)
-        listener.close()
+        listener.shutdown(socket.SHUT_RDWR)  # the helper sees it, and ends
         thread.join(TIMEOUT)
+        listener.close()
         assert not thread.is_alive()
 
 
@@ -178,7 +202,7 @@ def test_a_press_that_fails_ends_it(tmp_path: Path) -> None:
 
     def run() -> None:
         try:
-            helper.serve(listener, broken, interval=1.0, read_timeout=0.5)
+            helper.serve(listener, broken, interval=1.0, read_timeout=0.5, dark=Displays())
         except OSError as error:
             errors.append(error)
 
@@ -203,8 +227,179 @@ def test_it_needs_its_socket_from_systemd() -> None:
 
 
 def test_its_settings_are_required() -> None:
-    with pytest.raises(SystemExit):
-        helper.main(["--interval", "1", "--settle", "0.5"])  # no --read-timeout
+    settings = {
+        "--interval": "1",
+        "--settle": "0.5",
+        "--read-timeout": "1",
+        "--touchscreens": "/dev/input",
+        "--displays": "/sys/class/drm",
+        "--rescan": "2",
+    }
+    for missing in settings:
+        argv = [
+            part for name, value in settings.items() if name != missing for part in (name, value)
+        ]
+        with pytest.raises(SystemExit) as stopped:
+            helper.main(argv)
+        assert stopped.value.code == 2, missing  # argparse's, before it looks for its socket
+
+
+# ---- touch screens ----
+
+
+def touch(kind: int, code: int, value: int) -> bytes:
+    return helper.EVENT.pack(0, 0, kind, code, value)
+
+
+DOWN = touch(helper.EV_KEY, helper.BTN_TOUCH, 1)
+UP = touch(helper.EV_KEY, helper.BTN_TOUCH, 0)
+FRAME = touch(helper.EV_SYN, helper.SYN_REPORT, 0)
+EV_ABS, ABS_MT_TRACKING_ID = 0x03, 0x39  # include/uapi/linux/input-event-codes.h
+
+
+def test_a_touch_begins_with_btn_touch_at_one() -> None:
+    assert helper.BTN_TOUCH == 330  # include/uapi/linux/input-event-codes.h
+    assert helper.began(touch(EV_ABS, ABS_MT_TRACKING_ID, 4) + DOWN + FRAME)
+    assert not helper.began(UP + FRAME)
+    assert not helper.began(touch(helper.EV_KEY, helper.BTN_TOUCH, 2))  # a repeat, not a begin
+    assert not helper.began(touch(EV_ABS, ABS_MT_TRACKING_ID, 4) + FRAME)
+    assert not helper.began(touch(helper.EV_KEY, helper.KEY_WAKEUP, 1))
+    assert not helper.began(touch(EV_ABS, helper.BTN_TOUCH, 1))  # BTN_TOUCH's number, as ABS
+    assert not helper.began(b"")
+
+
+def connector(folder: Path, name: str, status: str, dpms: str) -> None:
+    (folder / name).mkdir(parents=True, exist_ok=True)
+    (folder / name / "status").write_bytes(f"{status}\n".encode())
+    (folder / name / "dpms").write_bytes(f"{dpms}\n".encode())
+
+
+def test_the_screen_is_dark_while_no_connected_display_is_on(tmp_path: Path) -> None:
+    drm = tmp_path / "drm"
+    # As on the Pi 5 (2026-11-16): writeback connectors are "unknown", and "On".
+    connector(drm, "card1-HDMI-A-1", "disconnected", "On")
+    connector(drm, "card1-HDMI-A-2", "connected", "Off")
+    connector(drm, "card1-Writeback-1", "unknown", "On")
+    (drm / "card1").mkdir()  # the card itself has no status
+    (drm / "version").write_bytes(b"drm 1.1.0 20060810\n")
+    assert helper.dark(str(drm))
+    for dpms, lit in (("On", True), ("Standby", False), ("Suspend", False), ("Off", False)):
+        connector(drm, "card1-HDMI-A-2", "connected", dpms)
+        assert helper.dark(str(drm)) is not lit, dpms
+    (drm / "card1-HDMI-A-2" / "dpms").unlink()  # unreadable: not a display that is on
+    assert helper.dark(str(drm))
+    assert helper.dark(str(tmp_path / "missing"))  # it cannot tell: a key does no harm
+
+
+def fifo(folder: Path, name: str) -> str:
+    path = folder / name
+    os.mkfifo(path)
+    return str(path)
+
+
+def writer(path: str) -> int:
+    """The writing end of the FIFO at ``path``, once the helper reads it."""
+    deadline = time.monotonic() + TIMEOUT
+    while True:
+        try:
+            return os.open(path, os.O_WRONLY | os.O_NONBLOCK)
+        except OSError:  # ENXIO: no reader yet
+            if time.monotonic() > deadline:
+                raise
+            time.sleep(0.01)
+
+
+def eventually(condition: Callable[[], bool]) -> None:
+    deadline = time.monotonic() + TIMEOUT
+    while not condition():
+        assert time.monotonic() < deadline, "not in time"
+        time.sleep(0.01)
+
+
+def test_it_opens_the_touch_screens_it_may_read(tmp_path: Path) -> None:
+    devices = tmp_path / "input"
+    devices.mkdir()
+    first, second = fifo(devices, "event0"), fifo(devices, "event1")
+    fifo(devices, "mouse0")  # not an event device
+    (devices / "event2").symlink_to(tmp_path / "nothing")  # one it cannot open
+    touchscreens = helper.Touchscreens(str(devices), 2.0)
+    try:
+        assert [path for path, _ in touchscreens.scan()] == [first, second]
+        assert touchscreens.scan() == []  # not twice
+        assert sorted(touchscreens.files) == [first, second]
+        fd = touchscreens.files[first]
+        assert os.get_blocking(fd) is False
+        assert os.get_inheritable(fd) is False
+        with pytest.raises(OSError):
+            os.write(fd, DOWN)  # read only
+        assert touchscreens.read(fd) == b""  # nothing written: it went
+        assert touchscreens.read(-1) == b""  # a read that fails, as with ENODEV: it went
+        touchscreens.forget(first)
+        assert list(touchscreens.files) == [second]
+        assert helper.Touchscreens(str(tmp_path / "missing"), 2.0).scan() == []
+    finally:
+        touchscreens.close()
+    assert touchscreens.files == {}
+    with pytest.raises(OSError):
+        os.fstat(fd)  # closed
+
+
+def test_a_touch_on_a_dark_screen_lights_it(tmp_path: Path) -> None:
+    devices = tmp_path / "input"
+    devices.mkdir()
+    first, second = fifo(devices, "event0"), fifo(devices, "event1")
+    touchscreens = helper.Touchscreens(str(devices), 0.05)
+    displays = Displays()
+    clock = [100.0]
+    with serving(tmp_path, clock, touchscreens, displays) as (path, presses):
+        ends = [writer(first), writer(second)]
+        try:
+            displays.dark = False
+            os.write(ends[1], DOWN + FRAME)  # a lit screen: Mir has the touch
+            eventually(lambda: displays.asked == 1)
+            os.write(ends[0], UP + FRAME)  # no touch begins: the screen is not asked
+            displays.dark = True
+            os.write(ends[1], DOWN + FRAME)
+            eventually(lambda: presses == ["wake"])
+            assert displays.asked == 2
+            os.write(ends[0], DOWN + FRAME)  # at most once per interval, with the robot's
+            assert ask(path, helper.REQUEST) == b"ok\n"
+            eventually(lambda: displays.asked == 3)
+            assert presses == ["wake"]
+            clock[0] = 101.0
+            os.write(ends[0], DOWN + FRAME)
+            eventually(lambda: presses == ["wake", "wake"])
+        finally:
+            for end in ends:
+                os.close(end)
+    touchscreens.close()
+
+
+def test_a_touch_screen_that_comes_back_is_read_again(tmp_path: Path) -> None:
+    devices = tmp_path / "input"
+    devices.mkdir()
+    first = fifo(devices, "event0")
+    touchscreens = helper.Touchscreens(str(devices), 0.05)
+    clock = [100.0]
+    with serving(tmp_path, clock, touchscreens) as (_, presses):
+        os.close(writer(first))  # it goes, as when USB enumerates it again
+        eventually(lambda: first not in touchscreens.files)
+        second = fifo(devices, "event1")  # and another comes
+        time.sleep(4 * touchscreens.rescan)
+        with pytest.raises(OSError):  # ENXIO: not read before the next look
+            os.close(os.open(second, os.O_WRONLY | os.O_NONBLOCK))
+        clock[0] = 101.0  # the next look
+        ends = [writer(first), writer(second)]
+        try:
+            os.write(ends[0], DOWN + FRAME)
+            eventually(lambda: presses == ["wake"])
+            clock[0] = 102.0
+            os.write(ends[1], DOWN + FRAME)
+            eventually(lambda: presses == ["wake", "wake"])
+        finally:
+            for end in ends:
+                os.close(end)
+    touchscreens.close()
 
 
 def test_the_client_wakes_the_screen_through_the_helper(tmp_path: Path) -> None:

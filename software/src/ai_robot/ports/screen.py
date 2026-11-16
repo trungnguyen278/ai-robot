@@ -182,7 +182,13 @@ class Opened:
     """A page that shows the face has connected, and is ready."""
 
 
-ScreenEvent = Touch | Hold | Action | Close | Opened
+@dataclass(frozen=True, slots=True)
+class Woken:
+    """The owner woke the screen without a tap on the face: the compositor passes on no
+    touch from a dark screen, so a key that the touch pressed lit it (ADR-0021)."""
+
+
+ScreenEvent = Touch | Hold | Action | Close | Opened | Woken
 
 
 class Screen(Port):

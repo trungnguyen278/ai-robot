@@ -1,16 +1,21 @@
 // SPDX-License-Identifier: MIT
 /* The renderer's side of the screen protocol (protocol/screen/README.md): it receives
    what to show from the robot software over a WebSocket, and reports the screen, its
-   taps and holds, and what the owner does on a panel. When the connection drops, the
-   face keeps playing the last state, any panel goes, and the link reconnects; when
-   the software serves a new revision of these files, the page reloads itself to run
-   it. */
+   taps and holds, a touch that lit the dark screen, and what the owner does on a
+   panel. When the connection drops, the face keeps playing the last state, any panel
+   goes, and the link reconnects; when the software serves a new revision of these
+   files, the page reloads itself to run it. */
 
 import { EXPRESSIONS } from './expressions.js';
 import { SCENES } from './scenes/index.js';
 import { ASLEEP } from './sleep.js';
 
 export const PROTOCOL = 1;
+// The key that lights a dark screen, as a KeyboardEvent's code (UI Events KeyboardEvent
+// code Values, "WakeUp"): Linux's KEY_WAKEUP, which Chromium maps to it
+// (ui/events/keycodes/dom/dom_code_data.inc). The robot's wake helper presses it when a
+// touch lands on the dark screen, a touch Mir does not pass on (ADR-0021).
+export const WAKE_KEY = 'WakeUp';
 
 /** Apply one message from the software to `player` (player.js) and, if there are
     ones, `panel` (panel.js) and `sleep` (sleep.js). Returns whether the message was
@@ -147,6 +152,13 @@ export class Link {
   /** Report a tap at `x`, `y`: fractions of the screen's width and height. */
   touch(x, y) {
     this.send({ type: 'touch', x, y });
+  }
+
+  /** Report a key pressed on the page, by its `code`: the wake key, while the robot
+      sleeps, means that a touch lit the dark screen, and wakes it as a tap would. Awake,
+      the robot lit the screen itself. */
+  key(code) {
+    if (code === WAKE_KEY && this.sleep?.asleep) this.send({ type: 'wake' });
   }
 
   /** Report a press held still at `x`, `y`, as for `touch`. */

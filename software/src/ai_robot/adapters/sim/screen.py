@@ -15,6 +15,7 @@ from ai_robot.ports.screen import (
     ScreenEvent,
     ScreenState,
     Touch,
+    Woken,
 )
 
 
@@ -60,3 +61,7 @@ class SimScreen(Screen):
     def open_page(self) -> None:
         """Simulate a page that shows the face connecting."""
         self._events.put_nowait(Opened())
+
+    def wake(self) -> None:
+        """Simulate a touch on the dark screen, which only a key lights."""
+        self._events.put_nowait(Woken())

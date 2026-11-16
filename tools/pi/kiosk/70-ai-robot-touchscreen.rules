@@ -1,0 +1,7 @@
+# Touch screens for root to read and write, and for the touchscreen group, which only
+# ai-robot-wake has, to read: Mir passes on no touch from a screen that is off, so the
+# helper watches them, and lights the screen when one is touched
+# (docs/decisions/0021-sleep-and-wake.md). ID_INPUT_TOUCHSCREEN comes from udev's input_id
+# builtin, in 60-input-id.rules, which runs before this file; this GROUP replaces the
+# "input" of 50-udev-default.rules.
+SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT_TOUCHSCREEN}=="1", GROUP="touchscreen", MODE="0640"

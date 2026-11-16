@@ -26,6 +26,7 @@ from ai_robot.ports import (
     PanelSection,
     ScreenState,
     Touch,
+    Woken,
 )
 
 VOCABULARY = Path(__file__).resolve().parents[2] / "protocol" / "screen" / "vocabulary.json"
@@ -126,6 +127,8 @@ def test_serves_the_renderer_and_drives_its_pages(ui_dir: Path) -> None:
                 assert await asyncio.wait_for(screen.event(), TIMEOUT) == Opened()
                 await page.send_json({"type": "touch", "x": 0.25, "y": 0.75})
                 assert await asyncio.wait_for(screen.event(), TIMEOUT) == Touch(0.25, 0.75)
+                await page.send_json({"type": "wake"})
+                assert await asyncio.wait_for(screen.event(), TIMEOUT) == Woken()
 
                 await screen.look((0.5, -0.25))
                 assert await receive(page) == {"type": "look", "target": {"x": 0.5, "y": -0.25}}

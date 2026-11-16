@@ -24,6 +24,9 @@ readonly HELPER_SOURCE=$TREE/software/src/ai_robot/adapters/wake/helper.py
 readonly PYTHON=$TREE/software/.venv/bin/python
 readonly CONFIG_DIR=$TREE/software/config
 readonly UINPUT_GROUP=uinput
+# The group that may read the touch screens, which only the helper has: it lights the dark
+# screen when one is touched.
+readonly TOUCH_GROUP=touchscreen
 # Groups the robot's user must not be in: either lets it type into the kiosk's Chromium,
 # which runs as root. uinput creates input devices; input writes events into existing
 # ones, such as the touch screen's (drivers/input/evdev.c, evdev_write).
@@ -96,7 +99,7 @@ prepare() {
 # Each file of tools/pi/kiosk/ that is installed: the file, then where it goes, from /.
 files() {
     printf '%s %s\n' \
-        70-ai-robot-uinput.rules etc/udev/rules.d/70-ai-robot-uinput.rules \
+        70-ai-robot-uinput.rules etc/udev/rules.d/70-ai-robot-uinput.rules         70-ai-robot-touchscreen.rules etc/udev/rules.d/70-ai-robot-touchscreen.rules \
         ai-robot-wake.socket "$UNITS/ai-robot-wake.socket" \
         ai-robot-wake.service "$UNITS/ai-robot-wake.service" \
         ai-robot.service "$UNITS/ai-robot.service" \
@@ -113,6 +116,16 @@ render() {
 # Frame's config option: the lines of frame.config that are not comments.
 frame_config() {
     grep -v -e '^#' -e '^$' "$KIOSK/frame.config"
+}
+
+# The device nodes of the touch screens, one a line, as udev tells them apart.
+touchscreens() {
+    local node
+    for node in /dev/input/event*; do
+        [[ $(udevadm info --query=property --property=ID_INPUT_TOUCHSCREEN --value --name="$node" 2>/dev/null) == 1 ]] &&
+            printf '%s\n' "$node"
+    done
+    return 0
 }
 
 in_group() {
@@ -168,14 +181,16 @@ install_kiosk() {
     printf 'To put it in place, as root:\n'
     as_root() { printf '  %s\n' "$*"; }
     as_root "getent group $UINPUT_GROUP >/dev/null || groupadd --system $UINPUT_GROUP"
+    as_root "getent group $TOUCH_GROUP >/dev/null || groupadd --system $TOUCH_GROUP"
     while read -r template destination; do
         as_root "install -D -m 0644 $dir/$destination /$destination"
     done < <(files)
     as_root "install -D -m 0644 $dir/$HELPER /$HELPER"
-    # The rule applies to /dev/uinput now, and from boot on.
+    # The rules apply to /dev/uinput and the touch screens now, and from boot on.
     as_root "udevadm control --reload"
     as_root "modprobe uinput"
     as_root "udevadm trigger --settle --action=change --subsystem-match=misc --sysname-match=uinput"
+    as_root "udevadm trigger --settle --action=change --subsystem-match=input --property-match=ID_INPUT_TOUCHSCREEN=1"
     local name held=0
     for name in "${FORBIDDEN_GROUPS[@]}"; do
         if in_group "$name"; then
@@ -237,6 +252,11 @@ check_kiosk() {
     cmp -s "$HELPER_SOURCE" "/$HELPER" || problem "/$HELPER is not this tree's helper"
     [[ $(stat -c '%U %G %a' /dev/uinput 2>/dev/null) == "root $UINPUT_GROUP 660" ]] ||
         problem "/dev/uinput is not for root and the $UINPUT_GROUP group alone"
+    local node
+    while read -r node; do
+        [[ $(stat -c '%U %G %a' "$node" 2>/dev/null) == "root $TOUCH_GROUP 640" ]] ||
+            problem "$node, a touch screen, is not for root, and the $TOUCH_GROUP group to read"
+    done < <(touchscreens)
 
     local name
     for name in "${FORBIDDEN_GROUPS[@]}"; do
