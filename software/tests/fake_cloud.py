@@ -4,8 +4,9 @@ endpoint, and its side of the control channel, which a test plays.
 
 The token endpoint checks assertions with PyJWT, a JWT library of its own, so that the
 robot's hand-made ES256 assertions are proven to be standard. Every message the robot
-sends on the control channel is checked against the protocol's schema, and its
-numbering; what breaks either is kept in ``problems``.
+sends on the control channel is read as the cloud link 3.1 reads it, JSON that every
+side can hold, and checked against the protocol's schema, and its numbering; what breaks
+any of them is kept in ``problems``.
 """
 
 from __future__ import annotations
@@ -21,12 +22,13 @@ from typing import Any
 import jwt
 from aiohttp import WSMsgType, web
 
-from ai_robot.core.data import Schema
+from ai_robot.core.data import Schema, read_json
 from ai_robot.core.jose import thumbprint
 
 ASSERTION_TYPE = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
 SCHEMA = Path(__file__).resolve().parents[2] / "platform" / "protocols" / "cloud" / "schema.json"
 UNNUMBERED = {"hello", "ping", "pong", "reconnect", "bye"}
+MAX_MESSAGE = 1 << 20  # bytes in a message, past which a side closes with 1009
 TIMEOUT = 5.0
 
 
@@ -42,7 +44,7 @@ class CloudSide:
     It reads what the robot sends: pings are answered at once (unless ``answer_pings``
     is off) and kept in ``pings``; ``next`` gives the other messages, in order.
     ``received`` is the number of the last one the cloud received, and ``sent`` that
-    of the last it sent.
+    of the last it sent. ``close_code`` is how the connection closed, once it did.
     """
 
     def __init__(self, ws: web.WebSocketResponse, problems: list[str]) -> None:
@@ -53,15 +55,24 @@ class CloudSide:
         self.answer_pings = True
         self.pings: list[dict[str, Any]] = []
         self.closed = asyncio.Event()
+        self.close_code: int | None = None
         self._messages: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self._schema = schema("from_device")
 
     async def run(self) -> None:
         try:
             async for frame in self.ws:
-                if frame.type is WSMsgType.TEXT:
-                    await self._take(json.loads(frame.data))
+                if frame.type is not WSMsgType.TEXT:
+                    self.problems.append(f"a {frame.type.name} frame")
+                    continue
+                try:
+                    message = read_json(frame.data)
+                except ValueError as error:
+                    self.problems.append(f"a text that the cloud cannot read: {error}")
+                    continue
+                await self._take(message)
         finally:
+            self.close_code = self.ws.close_code
             self.closed.set()
 
     async def _take(self, message: dict[str, Any]) -> None:
@@ -120,7 +131,7 @@ class CloudSide:
         self.sent = sent
         hello: dict[str, Any] = {
             "type": "hello",
-            "protocol": "3.0",
+            "protocol": "3.1",
             "session": session,
             "resumed": resumed,
             "time": "2026-10-28T03:20:00.310Z",
@@ -155,8 +166,11 @@ class FakeCloud:
     """Knows the robots in ``robots`` (identifier -> public JWK). Each connection to its
     control channel waits in ``connections`` for a test to play the cloud's side.
 
-    - ``answer``, if set, is what the token endpoint answers instead of a token, and
-      ``redirect`` where it redirects to;
+    - ``answer``, if set, is what the token endpoint answers instead of a token, as JSON
+      or as the bytes it is, and
+      ``redirect`` where it redirects to; ``refuse_token``, if set, is the refusal it
+      answers to a robot that it knows: a status, an error and headers, and
+      ``token_refusals`` counts them;
     - ``redirect_link``, if set, is where the control channel redirects to;
     - ``refuse``, if set, is the status that the control channel's handshake answers,
       with ``refuse_headers``; ``refuse_tokens`` handshakes are refused as if their
@@ -168,6 +182,8 @@ class FakeCloud:
         self.robots = dict(robots)
         self.answer: Any = None
         self.redirect: str | None = None
+        self.refuse_token: tuple[int, str, dict[str, str]] | None = None
+        self.token_refusals = 0
         self.redirect_link: str | None = None
         self.elsewhere: list[str] = []  # what reached /elsewhere, which a redirect may name
         self.refuse: int | None = None
@@ -223,9 +239,18 @@ class FakeCloud:
         try:
             header = jwt.get_unverified_header(assertion)
             robot = jwt.decode(assertion, options={"verify_signature": False})["iss"]
-            key = self.robots.get(robot)
-            if key is None or header.get("kid") != thumbprint(key) or header.get("typ") != "JWT":
-                return refusal(401, "invalid_client")
+        except (jwt.PyJWTError, KeyError):
+            return refusal(400, "invalid_request")  # no JWT
+        key = self.robots.get(robot)
+        if key is None or header.get("kid") != thumbprint(key):
+            return refusal(401, "invalid_client")  # a key it does not know
+        if self.refuse_token is not None:
+            self.token_refusals += 1
+            status, error, headers = self.refuse_token
+            return refusal(status, error, headers)
+        try:
+            if header.get("typ") != "JWT":
+                raise jwt.InvalidTokenError("not a JWT")
             claims = jwt.decode(
                 assertion,
                 jwt.PyJWK(dict(key)).key,
@@ -233,12 +258,14 @@ class FakeCloud:
                 audience=self.endpoint,
                 options={"require": ["iss", "sub", "aud", "iat", "exp", "jti"]},
             )
-        except (jwt.PyJWTError, KeyError):
-            return refusal(401, "invalid_client")
+        except jwt.PyJWTError:
+            return refusal(400, "invalid_grant")  # the assertion of a key it knows fails
         seen = {old["jti"] for old in self.assertions}
         if claims["sub"] != robot or claims["exp"] - claims["iat"] > 300 or claims["jti"] in seen:
-            return refusal(401, "invalid_client")
+            return refusal(400, "invalid_grant")
         self.assertions.append(claims)
+        if isinstance(self.answer, bytes):
+            return web.Response(body=self.answer, content_type="application/json")
         if self.answer is not None:
             return web.json_response(self.answer)
         token = f"access-{next(self._numbers)}"
@@ -263,7 +290,8 @@ class FakeCloud:
         if bearer.removeprefix("Bearer ") not in self.tokens or self.refuse_tokens:
             self.refuse_tokens = max(0, self.refuse_tokens - 1)
             return web.json_response({"title": "Unauthorized"}, status=401)
-        ws = web.WebSocketResponse()
+        # aiohttp refuses a message of max_msg_size bytes and more.
+        ws = web.WebSocketResponse(max_msg_size=MAX_MESSAGE + 1)
         await ws.prepare(request)
         side = CloudSide(ws, self.problems)
         self.connections.put_nowait(side)
@@ -272,6 +300,7 @@ class FakeCloud:
         return ws
 
 
-def refusal(status: int, error: str) -> web.Response:
+def refusal(status: int, error: str, headers: Mapping[str, str] | None = None) -> web.Response:
     """An OAuth 2.0 error (RFC 6749, §5.2)."""
-    return web.json_response({"error": error, "error_description": error}, status=status)
+    body = {"error": error, "error_description": error}
+    return web.json_response(body, status=status, headers=headers)

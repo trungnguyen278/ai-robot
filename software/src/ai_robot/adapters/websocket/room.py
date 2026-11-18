@@ -17,8 +17,8 @@ from typing import Any
 
 from livekit import rtc
 
-from ai_robot.adapters.websocket.session import MAX_MESSAGE, Bucket, parse
-from ai_robot.core.data import Schema, encode
+from ai_robot.adapters.websocket.session import MAX_MESSAGE, MAX_WARNED, Bucket
+from ai_robot.core.data import Schema, encode, read_json
 from ai_robot.ports.cloud import (
     CloudPart,
     ConversationAudio,
@@ -362,9 +362,11 @@ class ConversationRoom:
         """The part of the conversation that a message from an agent says, if any. A
         message that is not valid is ignored: the room has no errors."""
         try:
-            message = parse(text)
+            message = read_json(text)
         except ValueError:
-            self._once("json", "ignoring messages from the agent that are not JSON")
+            self._once(
+                "json", "ignoring messages from the agent that are not JSON every side holds"
+            )
             return None
         problem = self.schema.problem(message)
         if problem is not None:
@@ -407,7 +409,7 @@ class ConversationRoom:
         task.add_done_callback(self._tasks.discard)
 
     def _once(self, key: str, text: str, *args: object) -> None:
-        if key not in self._warned:
+        if key not in self._warned and len(self._warned) < MAX_WARNED:
             self._warned.add(key)
             log.info(text, *args)
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import json
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -17,10 +18,17 @@ import pytest
 from fake_cloud import FakeCloud, schema
 
 from ai_robot.adapters.sim.identity import SimIdentity
-from ai_robot.adapters.websocket.tokens import NoToken, NotSetUp, access_token, assertion
+from ai_robot.adapters.websocket.tokens import (
+    MAX_ANSWER,
+    NoToken,
+    NotSetUp,
+    access_token,
+    assertion,
+)
 from ai_robot.core.jose import b64url, thumbprint
 
 TIMEOUT = 5.0
+DAY = 86400
 
 
 @contextlib.asynccontextmanager
@@ -92,9 +100,59 @@ def test_a_robot_the_server_does_not_know_must_be_set_up() -> None:
     asyncio.run(main())
 
 
+LATER = "Wed, 21 Oct 2099 07:28:00 GMT"  # beyond the longest wait the protocol speaks of
+
+
+@pytest.mark.parametrize(
+    ("status", "error", "headers", "said", "wait"),
+    [
+        (400, "invalid_grant", {}, "400, invalid_grant", None),
+        (400, "invalid_request", {}, "400, invalid_request", None),
+        (429, "temporarily_unavailable", {"Retry-After": "7"}, "429, temporarily_unavailable", 7),
+        (
+            503,
+            "temporarily_unavailable",
+            {"Retry-After": LATER},
+            "503, temporarily_unavailable",
+            DAY,
+        ),
+        # Only a 401 with invalid_client says the server does not know the robot (PROV-3).
+        (400, "invalid_client", {}, "400, invalid_client", None),
+        (401, "invalid_grant", {}, "401, invalid_grant", None),
+        (401, "secret-code", {}, "401, another error", None),
+    ],
+)
+def test_a_refused_token_is_no_reason_to_set_up_again(
+    status: int, error: str, headers: dict[str, str], said: str, wait: float | None
+) -> None:
+    async def main() -> None:
+        async with server_and_robot() as (server, identity, http):
+            server.refuse_token = (status, error, headers)
+            with pytest.raises(NoToken) as refused:
+                await token(server, identity, http)
+            assert type(refused.value) is NoToken
+            assert str(refused.value) == f"the server refused the robot's token ({said})"
+            assert refused.value.retry_after == wait
+
+    asyncio.run(main())
+
+
+def test_a_refusal_the_robot_cannot_read_is_no_reason_to_set_up_again() -> None:
+    async def main() -> None:
+        async with server_and_robot() as (server, identity, http):
+            server.refuse_token = (401, "invalid_client\x00", {})  # not JSON every side holds
+            with pytest.raises(NoToken) as refused:
+                await token(server, identity, http)
+            assert type(refused.value) is NoToken
+            assert "another error" in str(refused.value)
+
+    asyncio.run(main())
+
+
 @pytest.mark.parametrize(
     ("answer", "message"),
     [
+        ({"access_token": "a\x00", "token_type": "Bearer", "expires_in": 600}, "is not a token"),
         ({"access_token": "a"}, "is not a token"),
         ("not a token", "is not a token"),
         ({"access_token": "a", "token_type": "Bearer", "expires_in": 0}, "is not a token"),
@@ -107,6 +165,40 @@ def test_an_answer_that_is_not_a_proper_token_is_refused(answer: Any, message: s
             server.answer = answer
             with pytest.raises(NoToken, match=message):
                 await token(server, identity, http)
+
+    asyncio.run(main())
+
+
+def padded(answer: dict[str, Any], size: int) -> bytes:
+    """``answer`` in JSON, followed by spaces that make it ``size`` bytes long: what the
+    robot would take if it read only part of it."""
+    text = json.dumps(answer).encode()
+    return text + b" " * (size - len(text))
+
+
+@pytest.mark.parametrize(("size", "taken"), [(MAX_ANSWER, True), (MAX_ANSWER + 1, False)])
+def test_an_answer_longer_than_the_robot_reads_is_no_token(size: int, taken: bool) -> None:
+    async def main() -> None:
+        async with server_and_robot() as (server, identity, http):
+            answer = {"access_token": "a", "token_type": "Bearer", "expires_in": 600}
+            server.answer = padded(answer, size)
+            if taken:
+                assert await token(server, identity, http) == "a"
+                return
+            with pytest.raises(NoToken, match="is not a token: must be of type object"):
+                await token(server, identity, http)
+
+    asyncio.run(main())
+
+
+def test_a_refusal_longer_than_the_robot_reads_still_says_when_to_ask_again() -> None:
+    async def main() -> None:
+        async with server_and_robot() as (server, identity, http):
+            server.refuse_token = (429, "x" * MAX_ANSWER, {"Retry-After": "7"})
+            with pytest.raises(NoToken) as refused:
+                await token(server, identity, http)
+            assert str(refused.value) == "the server refused the robot's token (429, another error)"
+            assert refused.value.retry_after == 7
 
     asyncio.run(main())
 

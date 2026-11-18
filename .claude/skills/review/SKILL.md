@@ -38,6 +38,19 @@ A failing check is a finding; fix it before reading further.
 - What does a page get on its first connection, before any state, and after a reconnect? Old pages and unknown fields are handled.
 - Schemas are checked through `core/data.py`'s `Schema`, never a bare validator: Python's `$` also matches before a last newline, which JSON Schema's, ECMA-262's, does not, and jsonschema's messages quote the value. A problem is logged and sent, so it names where and the rule broken, never the value, which may be a password or a token.
 - JSON from another side is read with `core/data.py`'s `read_json`, never a bare `json.loads`, which takes NaN, a lone surrogate, a U+0000 and any nesting that its stack allows (ai-platform's ADR-0014). Text the robot sends holds no U+0000 either: a network name with a NUL byte goes as `ssid_hex`.
+- A check made after parsing misses what the parser dropped: `json` keeps only the last value of a repeated name, so a U+0000 in the first passed unseen. `read_json` refuses repeated names (ADR-0014, decision 4). What the robot sends goes through `write_json`, so that the other side can read it.
+- A JSON value from another side may be a list or an object: `value in a_frozenset` then raises `TypeError`. Check that it is a string first.
+- Work on another side's text must take time in proportion to its length:
+  - A regular expression that needs a closing delimiter is tried again from each escape before it. The string pattern in `read_json` once needed 2 h for 1 MiB, so its closing quote is optional.
+  - jsonschema's `uniqueItems` compares each item with every other. `Schema` checks it only within the array's `maxItems` and `items`, and every such array in the protocols has both.
+  - Time a test at the protocol's largest message, 1 MiB.
+- Numbers from another side:
+  - An integer past a double's range is refused as a float is. `int()` refuses more than 4,300 digits (`sys.int_info`), and a reader in JavaScript takes the integer as an infinity.
+  - A `Retry-After` is digits only (RFC 9110, §10.2.3). `int()` also takes `-5`, `1_000` and other scripts' digits, and a date can overflow `datetime`.
+- Size limits, at their exact value:
+  - aiohttp 3.14.5 refuses a message of `max_msg_size` bytes and more, so the limit is set one past the protocol's.
+  - A body read from another side is bounded before it is read, the token endpoint's answer included.
+- Text from another side reaches a log only once a schema has passed it, or quoted with `%r`: a line break in it would start a forged log line. What the robot remembers per kind or per sender (`MAX_WARNED`) is bounded.
 - An error replies to the message it answers whenever that message's `seq` can be read, in a handshake too; only an unreadable message's error has no `reply_to`.
 - To whom a message goes: a link that serves several peers sends each answer to its own peer only. A characteristic's `Value` reaches every subscriber; check what the transport does, not only what the port says.
 - What a receiver holds is bounded by what was announced, before it appends: count bytes, not fragments, and let an empty fragment cost nothing. Fragments also fit the longest attribute value, 512 bytes, at any MTU.

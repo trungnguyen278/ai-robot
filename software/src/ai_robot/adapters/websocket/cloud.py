@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import email.utils
 import itertools
 import json
 import logging
@@ -22,15 +21,15 @@ import random
 import time
 from collections import deque
 from collections.abc import Mapping, Sequence
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import aiohttp
 
 from ai_robot import software_version
-from ai_robot.adapters.websocket.connection import Connection, Ending
+from ai_robot.adapters.websocket.connection import PROTOCOL, Connection, Ending
 from ai_robot.adapters.websocket.conversations import Conversations
+from ai_robot.adapters.websocket.retry import retry_after
 from ai_robot.adapters.websocket.room import ConversationRoom
 from ai_robot.adapters.websocket.session import MAX_MESSAGE, Session, instant
 from ai_robot.adapters.websocket.tokens import NoToken, NotSetUp, access_token
@@ -55,10 +54,8 @@ from ai_robot.ports.identity import Identity
 log = logging.getLogger(__name__)
 
 # Fixed by the protocol (platform/protocols/cloud/README.md, Connecting and The session).
-PROTOCOL = "3.0"
 LINK_PATH = "/device/v3/link"
 MEDIA = "livekit"  # where conversations' audio goes
-LONGEST_WAIT = 86400.0  # seconds: the longest wait the protocol speaks of ($defs/seconds)
 
 
 class Refused(Exception):
@@ -301,7 +298,10 @@ class WebSocketCloud(Cloud):
                     self._needs_update("the cloud no longer speaks this version of the link")
                 reported = _outage(reported, refused)
                 wait = refused.retry_after or 0.0
-            except (NoToken, aiohttp.ClientError, OSError, TimeoutError) as error:
+            except NoToken as error:
+                reported = _outage(reported, error)
+                wait = error.retry_after or 0.0
+            except (aiohttp.ClientError, OSError, TimeoutError) as error:
                 reported = _outage(reported, error)
             except Exception:  # the link must outlive any failure, and try again
                 log.exception("the cloud link failed")
@@ -336,11 +336,13 @@ class WebSocketCloud(Cloud):
                 ws = await self._http.ws_connect(
                     _link_url(self.server),
                     headers={"Authorization": f"Bearer {token}"},
-                    max_msg_size=MAX_MESSAGE,
+                    # aiohttp refuses an uncompressed message of max_msg_size bytes and
+                    # more; the robot offers no compression, as aiohttp's client does not.
+                    max_msg_size=MAX_MESSAGE + 1,
                     timeout=aiohttp.ClientWSTimeout(ws_close=self.connect_timeout),
                 )
         except aiohttp.WSServerHandshakeError as error:
-            raise Refused(error.status, _retry_after(error.headers)) from None
+            raise Refused(error.status, retry_after(error.headers)) from None
         try:
             return await self._hold(Connection(ws, self.schema, self.connect_timeout))
         finally:
@@ -358,21 +360,12 @@ class WebSocketCloud(Cloud):
                 answer = await connection.first()
         except TimeoutError:
             log.warning("the cloud did not answer the hello within %g s", self.hello_timeout)
-            await connection.finish("no_hello")
-            return Ending(greeted=False)
-        if answer is None:
-            return Ending(greeted=False)  # the connection closed
-        problem = _hello_problem(self.schema, answer, resuming)
-        if problem is None and answer["type"] == "bye":
-            return Ending(greeted=False, reason=answer["reason"], by_cloud=True)
-        if problem is not None:
-            log.warning("the cloud's hello is not valid: %s", problem)
-            await connection.finish("no_hello")
-            return Ending(greeted=False)
-        if answer["protocol"].split(".")[0] != PROTOCOL.split(".")[0]:
-            log.warning("the cloud speaks the link %s, not %s", answer["protocol"], PROTOCOL)
-            await connection.finish("unsupported_protocol")
-            return Ending(greeted=False)
+            answer = Ending(greeted=False, reason="no_hello")
+        if isinstance(answer, Ending):
+            return await connection.end(answer)
+        if answer["resumed"] and (resuming is None or answer["session"] != resuming.id):
+            log.warning("the cloud's hello resumes a session the robot did not name")
+            return await connection.end(Ending(greeted=False, reason="no_hello"))
         if answer["resumed"]:
             assert resuming is not None
             session = resuming
@@ -501,21 +494,6 @@ def _link_url(server: str) -> str:
     return f"{'wss' if scheme == 'https' else 'ws'}://{rest}{LINK_PATH}"
 
 
-def _hello_problem(schema: Schema, answer: Any, resuming: Session | None) -> str | None:
-    """What is wrong with the cloud's first message, which must be its ``hello`` or a
-    ``bye``."""
-    problem = schema.problem(answer)
-    if problem is not None:
-        return problem
-    if answer["type"] == "bye":
-        return None
-    if answer["type"] != "hello":
-        return f"a {answer['type']} message came before the cloud's hello"
-    if answer["resumed"] and (resuming is None or answer["session"] != resuming.id):
-        return "it resumes a session the robot did not name"
-    return None
-
-
 def _changes(before: DeviceInfo, after: DeviceInfo) -> dict[str, Any]:
     """What ``device.changed`` says: the owner's choices that differ from ``before``."""
     changes: dict[str, Any] = {}
@@ -526,22 +504,3 @@ def _changes(before: DeviceInfo, after: DeviceInfo) -> dict[str, Any]:
     if after.allowed_classes != before.allowed_classes:
         changes["allowed_classes"] = sorted(str(safety) for safety in after.allowed_classes)
     return changes
-
-
-def _retry_after(headers: Mapping[str, str] | None) -> float | None:
-    """The wait a refusal's ``Retry-After`` asks for, in seconds (RFC 9110, §10.2.3),
-    within the longest the protocol speaks of."""
-    value = headers.get("Retry-After") if headers else None
-    if not value:
-        return None
-    try:
-        seconds = float(int(value))
-    except ValueError:
-        try:
-            when = email.utils.parsedate_to_datetime(value)
-        except (TypeError, ValueError, IndexError):
-            return None
-        if when.tzinfo is None:
-            when = when.replace(tzinfo=UTC)
-        seconds = (when - datetime.now(UTC)).total_seconds()
-    return min(max(seconds, 0.0), LONGEST_WAIT)
