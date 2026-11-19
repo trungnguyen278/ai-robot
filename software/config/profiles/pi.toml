@@ -46,3 +46,9 @@ adapter = "timedated"
 # Its screen lit by the kiosk's helper (tools/pi/README.md, docs/decisions/0021).
 [ports.display_power]
 adapter = "helper"
+
+# Its factory reset: the image erases its data partition and clears its TPM
+# (docs/decisions/0023-factory-reset.md). A Pi without the image selects "files" in
+# local.toml, with the file identity (local.example.toml).
+[ports.factory_reset]
+adapter = "systemd"

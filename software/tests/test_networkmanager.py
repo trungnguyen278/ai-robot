@@ -98,6 +98,7 @@ def test_joining_with_the_right_password(bus: str) -> None:
             assert profile["802-11-wireless"]["ssid"] == b"Home"
             assert profile["802-11-wireless-security"] == {"psk": "correct horse"}
             assert profile["connection"]["autoconnect"] is True
+            assert profile["user"] == {"data": {"ai-robot.setup": "joined"}}  # forgotten on reset
 
     asyncio.run(main())
 

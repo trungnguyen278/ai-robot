@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
-/* Shared tools for the scenes: where the face waits, time, the battery, shapes, and
-   a cache for drawing that never changes. Text is in ../text.js. */
+/* Shared tools for the scenes: where the face waits, time, the battery, shapes, a
+   spinner, and a cache for drawing that never changes. Text is in ../text.js. */
 
-import { clamp } from '../math.js';
+import { TAU, clamp } from '../math.js';
 import { BACKGROUND, rgba } from '../tones.js';
 
 // Where the face waits while a scene fills the screen: small, in the top right
@@ -11,6 +11,21 @@ import { BACKGROUND, rgba } from '../tones.js';
 export const CORNER = Object.freeze({ x: 110, y: -78, scale: 0.3 });
 
 const pad = (n) => String(n).padStart(2, '0');
+
+/** A ring with a turning arc, centred on x, y: something is going on. */
+export function spinner(ctx, x, y, r, t, alpha) {
+  ctx.lineWidth = 6;
+  ctx.lineCap = 'round';
+  ctx.globalAlpha = alpha * 0.2;
+  ctx.beginPath();
+  ctx.arc(x, y, r, 0, TAU);
+  ctx.stroke();
+  ctx.globalAlpha = alpha;
+  ctx.beginPath();
+  const start = TAU * ((t * 0.8) % 1);
+  ctx.arc(x, y, r, start, start + TAU * (0.25 + 0.1 * Math.sin(TAU * t * 0.5)));
+  ctx.stroke();
+}
 
 /** "4:05", or "1:04:05" from an hour up. */
 export function duration(seconds) {

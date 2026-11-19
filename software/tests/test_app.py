@@ -14,7 +14,7 @@ from ai_robot.adapters import ADAPTERS
 from ai_robot.app import App, ModuleError
 from ai_robot.core.config import ConfigError, load_config
 from ai_robot.core.module import Module, ModuleContext
-from ai_robot.messages import BatteryReport, SoundLevel
+from ai_robot.messages import BatteryReport, RestartRequested, SoundLevel
 from ai_robot.modules import MODULES
 from ai_robot.ports import Color, Lights
 
@@ -102,6 +102,20 @@ class LightsRecorder(Recorder):
     owns = ("lights",)
 
 
+class Needy(Recorder):
+    """Waits for answers from ``second`` on the bus, as the reset does from the cloud."""
+
+    needs = ("second",)
+
+
+class Restarter(Recorder):
+    """Asks the robot to start again, as the factory reset does once it erased it."""
+
+    async def run(self) -> None:
+        self.bus.publish(RestartRequested())
+        await super().run()
+
+
 @pytest.fixture
 def events(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     monkeypatch.setitem(MODULES, "first", LightsRecorder)
@@ -175,6 +189,24 @@ def test_an_owned_port_must_be_configured(events: list[str]) -> None:
 def test_unknown_module(events: list[str]) -> None:
     with pytest.raises(ConfigError, match="unknown module 'third'"):
         App(config(events, ["third"])).build()
+
+
+def test_a_module_starts_only_with_the_modules_it_needs(
+    events: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setitem(MODULES, "needy", Needy)
+    with pytest.raises(ConfigError, match="'needy' needs 'second'"):
+        App(config(events, ["first", "needy"])).build()
+    app = App(config(events, ["needy", "second"]))  # in any order
+    app.build()
+    assert [module.name for module in app.modules] == ["needy", "second"]
+
+
+def test_the_reset_needs_the_cloud(shipped_config: Path) -> None:
+    table = load_config("desktop", shipped_config)
+    table["modules"]["enabled"].remove("cloud")
+    with pytest.raises(ConfigError, match="'reset' needs 'cloud'"):
+        App(table).build()
 
 
 def test_unknown_adapter(events: list[str]) -> None:
@@ -275,6 +307,21 @@ def test_simultaneous_failures_are_all_reported(
     with pytest.raises(ModuleError):
         run(app, 10)
     assert "also failed" in caplog.text
+
+
+def test_a_module_can_have_the_robot_start_again(
+    events: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setitem(MODULES, "restarter", Restarter)
+    app = App(config(events, ["first", "restarter"]))
+    began = time.monotonic()
+    run(app, 10)
+    assert time.monotonic() - began < 5  # at once, not when stopped
+    assert app.restart
+    assert events[-3:] == ["stop restarter", "stop first", "close lights"]
+    stopped = App(config(events, ["first"]))
+    run(stopped, 0.01)
+    assert not stopped.restart
 
 
 def test_an_app_runs_only_once(events: list[str]) -> None:

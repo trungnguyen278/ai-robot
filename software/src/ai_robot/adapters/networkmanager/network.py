@@ -18,6 +18,8 @@ from dbus_fast import Message, MessageType, Variant
 from dbus_fast.aio import MessageBus
 
 from ai_robot.adapters.dbus import Owner, call, connect, watch
+from ai_robot.adapters.networkmanager import profiles
+from ai_robot.adapters.networkmanager.profiles import CONNECTION, NM
 from ai_robot.core.checks import positive
 from ai_robot.ports.network import (
     JoinError,
@@ -32,15 +34,11 @@ from ai_robot.ports.network import (
 log = logging.getLogger(__name__)
 
 # NetworkManager's D-Bus API (networkmanager.dev/docs/api/latest/).
-NM = "org.freedesktop.NetworkManager"
 NM_PATH = "/org/freedesktop/NetworkManager"
-SETTINGS_PATH = "/org/freedesktop/NetworkManager/Settings"
 DEVICE = f"{NM}.Device"
 WIRELESS = f"{NM}.Device.Wireless"
 ACCESS_POINT = f"{NM}.AccessPoint"
 IP4_CONFIG = f"{NM}.IP4Config"
-SETTINGS = f"{NM}.Settings"
-CONNECTION = f"{NM}.Settings.Connection"
 PROPERTIES = "org.freedesktop.DBus.Properties"
 NO_OBJECT = "/"
 # Its enumerations (nm-dbus-types).
@@ -236,6 +234,7 @@ class NetworkManagerNetwork(Network):
             wireless_security["psk"] = Variant("s", password)
         if wireless_security:
             settings["802-11-wireless-security"] = wireless_security
+        profiles.mark(settings)  # the factory reset forgets it
         return settings
 
     async def _activate(
@@ -297,16 +296,12 @@ class NetworkManagerNetwork(Network):
 
     async def _saved(self) -> dict[bytes, str]:
         """The Wi-Fi networks NetworkManager has a profile for: name -> profile."""
-        (paths,) = await self._call(SETTINGS_PATH, SETTINGS, "ListConnections", "", [])
+        assert self._bus is not None, "the network is not open"
         saved: dict[bytes, str] = {}
-        for path in paths:
-            try:
-                (settings,) = await self._call(path, CONNECTION, "GetSettings", "", [])
-            except ConnectionError:  # gone meanwhile
-                continue
-            wireless = settings.get("802-11-wireless")
-            if wireless and "ssid" in wireless:
-                saved[bytes(wireless["ssid"].value)] = path
+        for path, profile in await profiles.listed(self._bus):
+            ssid = profiles.ssid_of(profile)
+            if ssid is not None:
+                saved[ssid] = path
         return saved
 
     async def _access_points(self) -> list[dict[str, Variant]]:

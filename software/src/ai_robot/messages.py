@@ -461,6 +461,8 @@ class Setting:
     help: str | None = None
     unit: str | None = None  # shown after a number, such as "%"
     confirm: str | None = None  # asked before a boolean is switched on, or an action runs
+    confirm_lines: tuple[str, ...] = ()  # said under that question, one paragraph each
+    confirm_label: str | None = None  # the button that goes ahead, if not "Yes"
     closes: bool = False  # an action that leaves the settings, such as opening set-up
 
     def __post_init__(self) -> None:
@@ -479,6 +481,7 @@ class Setting:
             raise ValueError(f"setting {self.name}: an info's value is its text")
         if self.closes and self.kind is not SettingKind.ACTION:
             raise ValueError(f"setting {self.name}: only an action closes the settings")
+        object.__setattr__(self, "confirm_lines", tuple(self.confirm_lines))
 
 
 @dataclass(frozen=True, slots=True)
@@ -491,15 +494,24 @@ class SettingOffered(Message):
 
 @dataclass(frozen=True, slots=True)
 class SettingChanged(Message):
-    """The owner changed setting ``name`` to ``value``, or pressed it if it is an action
-    (``value`` is then ``None``). Published by settings, from the screen or from what
-    it kept; read by the setting's module, which checks the value and applies it."""
+    """The owner changed setting ``name`` to ``value``. Published by settings, from the
+    screen or from what it kept; read by the setting's module, which checks the value and
+    applies it. An action is never changed, only pressed (``SettingPressed``)."""
 
     name: str
     value: Any = None
 
     def __post_init__(self) -> None:
         _plain_value(self.name, self.value)
+
+
+@dataclass(frozen=True, slots=True)
+class SettingPressed(Message):
+    """The owner pressed action ``name`` on the settings panel. Published by settings,
+    only from the screen, so that nothing kept runs an action at start; read by the
+    action's module, which does it."""
+
+    name: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -520,3 +532,37 @@ class SettingRequested(Message):
 class SettingsOpened(Message):
     """The settings are on screen: modules refresh what their lines show. Published by
     settings."""
+
+
+# The factory reset (docs/decisions/0023-factory-reset.md): reset erases the robot, once
+# cloud has taken it out of its home; set-up and the settings stay closed meanwhile.
+
+
+class ResetStage(StrEnum):
+    LEAVING = "leaving"  # the robot leaves its home, if it can
+    NOT_LEFT = "not_left"  # it could not: the screen says to remove it in the app
+    ERASING = "erasing"
+
+
+@dataclass(frozen=True, slots=True)
+class Resetting(Message):
+    """The robot is being reset, now at ``stage``. Published by reset. From the first,
+    set-up and the settings close and stay closed, and ``LEAVING`` has cloud take the
+    robot out of its home."""
+
+    stage: ResetStage
+
+
+@dataclass(frozen=True, slots=True)
+class HomeLeft(Message):
+    """Whether the robot left its home, or was in none (``left``), or could not tell the
+    cloud in time. Published by cloud for a reset's ``LEAVING``; read by reset."""
+
+    left: bool
+
+
+@dataclass(frozen=True, slots=True)
+class RestartRequested(Message):
+    """Start the robot again: the application stops, and a new one starts, as the
+    configuration and the robot's files now say. Published by reset once the robot is
+    erased; read by the application."""

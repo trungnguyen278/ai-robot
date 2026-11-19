@@ -102,6 +102,8 @@ function styleSheet() {
 .panel .box { max-width: min(480px, 100%); padding: 24px; border-radius: 16px;
   background: ${rgba(BACKGROUND, 1)}; border: 1px solid ${accent(0.4)}; }
 .panel .box p { margin: 0 0 16px; font-size: 20px; }
+.panel .box .lines { margin: 0 0 16px; }
+.panel .box .lines p { margin: 0 0 8px; font-size: 16px; color: ${ink(0.75)}; }
 .panel .answers { display: flex; justify-content: flex-end; gap: 12px; }
 .panel .answers button { padding: 0 20px; border-radius: ${TARGET / 2}px; }
 .panel .answers .yes { background: ${accent(0.2)}; color: ${accent(1)}; font-weight: 700; }
@@ -313,7 +315,7 @@ export class PanelView {
         set(on);
         this.act(item.id, on);
       };
-      if (on && text(current.confirm)) this.ask(current.confirm, go);
+      if (on && text(current.confirm)) this.ask(current, go);
       else go();
     });
     this.updates.set(item.id, (next) => {
@@ -402,7 +404,7 @@ export class PanelView {
     row.type = 'button';
     row.addEventListener('click', () => {
       const go = () => this.act(item.id, undefined);
-      if (text(current.confirm)) this.ask(current.confirm, go);
+      if (text(current.confirm)) this.ask(current, go);
       else go();
     });
     this.updates.set(item.id, (next) => {
@@ -421,17 +423,23 @@ export class PanelView {
     return row;
   }
 
-  /** Ask `question` over the panel; `then` runs if the owner says yes. */
-  ask(question, then) {
+  /** Ask the question of `item` over the panel, with the lines under it and the label
+      of the answer that goes ahead; `then` runs if the owner goes ahead. */
+  ask(item, then) {
     const end = () => {
       this.dismiss = null;
       this.question.hidden = true;
       this.question.replaceChildren();
     };
-    const words = this.element('p', '', question);
+    const words = this.element('p', '', item.confirm);
     words.id = `${this.id}-question`;
+    const lines = this.element('div', 'lines');
+    lines.id = `${this.id}-lines`;
+    for (const line of Array.isArray(item.confirm_lines) ? item.confirm_lines : []) {
+      if (text(line)) lines.append(this.element('p', '', line));
+    }
     const no = this.control('no', 'Cancel', end);
-    const yes = this.control('yes', 'Yes', () => {
+    const yes = this.control('yes', text(item.confirm_label) || 'Yes', () => {
       end();
       then();
     });
@@ -441,7 +449,12 @@ export class PanelView {
     box.setAttribute('role', 'alertdialog');
     box.setAttribute('aria-modal', 'true');
     box.setAttribute('aria-labelledby', words.id);
-    box.append(words, answers);
+    box.append(words);
+    if (lines.childElementCount) {
+      box.setAttribute('aria-describedby', lines.id);
+      box.append(lines);
+    }
+    box.append(answers);
     this.question.replaceChildren(box);
     this.question.hidden = false;
     this.dismiss = end;

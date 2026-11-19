@@ -18,11 +18,12 @@ Python 3.11 or later (asyncio), with an optional C++ extension. Runtime dependen
 ## How it fits together
 
 ```
-modules    system · settings · motion · voice · vision · screen · setup · cloud · behavior
+modules    system · settings · motion · voice · vision · screen · setup · cloud · reset · behavior
              │  talk to each other only through messages on the bus
              │  each one owns some ports
 ports      audio_in · audio_out · wake_word · voice_activity · camera · screen · display_power
-           setup_link · network · cloud · identity · binding · settings · daylight · time_zone
+           setup_link · network · cloud · identity · binding · settings · factory_reset
+           daylight · time_zone
            drive · joints · range · power · lights · safety
              │  implemented by
 adapters   sim (any computer, CI)  |  real (on the robot), chosen per profile
@@ -38,9 +39,10 @@ adapters   sim (any computer, CI)  |  real (on the robot), chosen per profile
 | `settings` | `settings` | The owner's settings: what the modules offer, shown as one panel on the screen; what the owner chose, kept, and handed to their modules before they run ([ADR-0016](../docs/decisions/0016-settings.md)) |
 | `setup` | `setup_link`, `network` | Set-up with the owner's app over Bluetooth LE: when it opens, the code on the screen, the session, the Wi-Fi network ([set-up](https://github.com/trungnguyen278/ai-platform/blob/main/protocols/setup/README.md), in ai-platform) |
 | `cloud` | `cloud`, `identity`, `binding` | The link to `ai-cloud`, which the robot's identity proves: the cloud calls the capabilities the modules offer, and hears the events they declare; it tells the cloud the robot's languages and time zone, which `system` gives, and carries conversations, turns and answers with their audio, for `voice` ([the cloud link](https://github.com/trungnguyen278/ai-platform/blob/main/protocols/cloud/README.md), in ai-platform). It signs the robot's registration at set-up, and keeps whether the robot is bound. Its settings say what the cloud may do, by safety class |
+| `reset` | `factory_reset` | The factory reset the owner asks for in the settings: the robot leaves its home, erases itself even offline, and starts again as a new robot; a reset cut short goes on at the next start ([ADR-0023](../docs/decisions/0023-factory-reset.md)) |
 | `behavior` | `daylight` | Decides what the robot does: for now, reactions to taps, the clock when nobody interacts (taps and conversations count), a sleepy face from sunset to sunrise |
 
-- **Module:** one function of the robot (`core/module.py`). It owns some ports and talks to the other modules only through the bus.
+- **Module:** one function of the robot (`core/module.py`). It owns some ports and talks to the other modules only through the bus. One that waits for another's answers on the bus names it in `needs`, and the robot does not start without it.
 - **Message:** what a module tells the others; a frozen dataclass in `messages.py`, whose class is the topic.
 - **Port:** the interface to one piece of hardware or one service (`ports/`).
 - **Adapter:** an implementation of a port, simulated or real (`adapters/`).
@@ -146,12 +148,14 @@ On a computer the simulated adapters hear silence, so no conversation opens. To 
 
 By default the robot talks to a simulated cloud (the `sim` adapter of the `cloud` port). It opens a session once the robot has said what it is, and asks for nothing, so the robot runs without a server.
 
-The real link is the `websocket` adapter: the control channel of the [cloud link](https://github.com/trungnguyen278/ai-platform/blob/main/protocols/cloud/README.md) 3.1, a WebSocket to `ai-cloud` that stays open ([ai-platform ADR-0006](https://github.com/trungnguyen278/ai-platform/blob/main/docs/decisions/0006-two-channels.md)). Before each connection, the robot asks `ai-cloud` for an access token, and proves who it is with its `identity` port: an identifier, and a key that signs for it ([ADR-0010](../docs/decisions/0010-device-identity.md)).
+The real link is the `websocket` adapter: the control channel of the [cloud link](https://github.com/trungnguyen278/ai-platform/blob/main/protocols/cloud/README.md) 3.2, a WebSocket to `ai-cloud` that stays open ([ai-platform ADR-0006](https://github.com/trungnguyen278/ai-platform/blob/main/docs/decisions/0006-two-channels.md)). Before each connection, the robot asks `ai-cloud` for an access token, and proves who it is with its `identity` port: an identifier, and a key that signs for it ([ADR-0010](../docs/decisions/0010-device-identity.md)).
 - **Its key.** On the robot, the `tpm` adapter keeps it in the robot's TPM, which makes the key and never lets it out. A factory reset clears the TPM, which gives the robot a new identity, to be set up again. On a development computer, the `file` adapter keeps it in a file of your choosing, made on first use and readable only by you; like SSH, it refuses a key file that others can open. The `sim` adapter, the default, makes a new key at each start, which no server knows.
 - **Its tokens.** Only a refusal that says `invalid_client`, with 401, means the server does not know the robot, which must then be set up again. After any other refusal, of a token or of the WebSocket's handshake, the robot waits as long as its `Retry-After` asks, a day at most. It reads at most 1 MiB of the endpoint's answer.
 - **What it reads and sends** is JSON that every side can hold ([ai-platform ADR-0014](https://github.com/trungnguyen278/ai-platform/blob/main/docs/decisions/0014-json-every-side-can-hold.md)): `core/data.py`'s `read_json` reads it, in time that grows with its length only, and refuses a repeated name and an integer past a double's range, and `write_json` checks what the robot sends, which is logged and not sent when the cloud could not hold it. A message that the cloud numbered and that fails the schema gets an `error`, and the session goes on. A frame that the robot cannot answer ends the session with a `bye` `invalid_message`, which says why and names no value: one that is binary or not JSON, one with no type or no number, or a `hello`, `ping`, `pong` or `reconnect` that fails. A message over 1 MiB closes the connection with WebSocket's 1009, which ends the session too; one of 1 MiB is taken.
 - **Its session** outlives a lost connection. The robot numbers what it sends and keeps it until the cloud has it, pings at the pace the cloud sets, and connects again after a random wait that grows with each failure, resuming its session. If the cloud no longer speaks its version, the robot logs that it needs an update, and tries again only now and then.
 - **Conversations** are asked for and ended on the session, and held in a LiveKit room of their own, which the cloud names ([ADR-0009](../docs/decisions/0009-cloud-link-webrtc.md), [ADR-0018](../docs/decisions/0018-conversations.md)). Only agents may hear the robot's microphone, and they hear first what it heard from its wake word on, as LiveKit's pre-connect audio. The robot plays only agents' voices, and takes the turns and answers only from agents. It refuses a conversation the cloud opens to listen while its owner does not allow the cloud to listen, or its microphones are off.
+- **Leaving its home,** before a factory reset: in a session of 3.2, the robot sends `leave`, and asks again after the backoff while the cloud answers `internal`. `bye` `left` or `revoked`, or `invalid_client` from the token endpoint, mean it is out. After `leave_timeout` seconds without one, or without a session of 3.2, it gives up, and the reset goes on. It holds no conversation from the moment it asks.
+- **Removed in the app,** the robot only unbinds: it keeps its Wi-Fi networks, its name, its settings, its key and its server, and offers set-up again ([ADR-0022](../docs/decisions/0022-a-removed-robot-keeps-its-data.md), PROV-4).
 - **A server.** `ai-cloud` has no code yet: the link runs against the fake cloud of the tests (`tests/fake_cloud.py`).
 
 The server is the one in `server` until the robot is set up with another: set-up registers the robot with the server the owner's app names, and the robot then uses that one.
@@ -175,7 +179,17 @@ The owner changes the robot's settings on its screen. A press held still on the 
 - **Kept.** The `settings` port keeps what the owner chose: a file on the robot (the `file` adapter), nothing on a computer (`sim`). At start, the `settings` module hands each module its kept values before the modules run, so that a choice holds from the first moment, such as what the cloud may not do.
 - **Changed.** A change shows at once. The module that owns the setting applies it or refuses it; a refused value goes back.
 
-The settings so far: set-up with the app and the Wi-Fi network (`setup`), the volume and the microphones (`voice`), what the cloud may do, by safety class (`cloud`), and the robot's name, software, account and identifier.
+The settings so far: set-up with the app and the Wi-Fi network (`setup`), the volume and the microphones (`voice`), what the cloud may do, by safety class (`cloud`), the robot's name, software, account and identifier, and its factory reset (`reset`).
+
+### Factory reset
+
+The owner erases the robot on its screen: Settings, About, Reset to factory settings ([ADR-0023](../docs/decisions/0023-factory-reset.md)). A second screen says what goes and that it cannot be undone, with Cancel and Erase.
+- **Leaving.** The `reset` module keeps that a reset began, then the robot leaves its home, so that the app no longer lists it (`cloud`). Set-up and the settings close, and stay closed.
+- **Offline,** it erases itself anyway; its screen first says, for `note` seconds, to remove the robot in the app.
+- **Erasing.** The `factory_reset` port erases it, and the robot starts again in set-up, as a new robot. The `systemd` adapter, the `pi` profile's, has the robot's image do it, once systemd says it can, and once in a boot: systemd's `factory-reset.target` wipes the data partition and clears the TPM in early boot, then the system restarts. The `files` adapter erases the files and folders its settings list, which must be the robot's own (in a folder named `ai-robot`, as the record's is), and the Wi-Fi profiles set-up made, which set-up marks in NetworkManager; the robot then starts again in its process. On a Pi that runs the robot from its repository with a `file` identity, select `files` in `local.toml`, with the key file in its list (`local.example.toml`).
+- **Cut short,** by a power cut for one, a reset goes on at the next start, before set-up can open. Only the robot's own record does that: a file of anything else at its path is logged, and starts nothing. Neither does a settings file: an action is done only when it is pressed.
+
+The tests run it on the desktop profile with the `files` adapter (`tests/test_factory_reset.py`), and the `systemd` adapter against a fake systemd on a private D-Bus.
 
 ### C++ extension
 

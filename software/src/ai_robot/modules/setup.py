@@ -40,6 +40,7 @@ from ai_robot.messages import (
     LocaleRequested,
     RegistrationRequested,
     RegistrationSigned,
+    Resetting,
     SceneRequest,
     ScreenPriority,
     ScreenTouched,
@@ -121,6 +122,9 @@ class SetupModule(Module):
     - **The first settings.** ``system`` takes the languages and the time zone the app
       offers (``LocaleRequested``, ``LocaleApplied``), and tells them (``LocaleChanged``)
       for ``info``.
+    - **A factory reset** (``Resetting``) ends set-up and its session, and keeps it
+      closed: the robot starts again as a new one once erased
+      (docs/decisions/0023-factory-reset.md).
     """
 
     owns = ("setup_link", "network")
@@ -159,6 +163,8 @@ class SetupModule(Module):
         self._bindings = self.bus.subscribe(BindingChanged)
         self._touches = self.bus.subscribe(ScreenTouched)
         self._settings_opened = self.bus.subscribe(SettingsOpened)
+        self._resets = self.bus.subscribe(Resetting)
+        self.resetting = False  # a factory reset began: set-up stays closed
         self.settings = SettingsHost(self)
         self.settings.add(
             Setting(
@@ -220,6 +226,7 @@ class SetupModule(Module):
             tasks.create_task(self._watch_locale())
             tasks.create_task(self._watch_link())
             tasks.create_task(self._watch_time())
+            tasks.create_task(self._watch_resets())
 
     async def stop(self) -> None:
         self.settings.close()
@@ -256,6 +263,8 @@ class SetupModule(Module):
     async def _open(self) -> None:
         if self.robot_id is None:  # cloud has not said who the robot is yet
             return
+        if self._resetting():
+            return
         async with self._opening:
             if not self.is_open:
                 self.discriminator = draw_discriminator()
@@ -290,7 +299,9 @@ class SetupModule(Module):
     def _show(self) -> None:
         """What the screen shows of set-up (PROV-3: an unbound robot says so)."""
         data: dict[str, Any] | None
-        if self.is_open and self._session is not None and self._session.stage is Stage.OPEN:
+        if self._resetting():
+            data = None
+        elif self.is_open and self._session is not None and self._session.stage is Stage.OPEN:
             data = {"state": "connected"}
         elif self.is_open and self._secret is not None:
             text = setup_string(self.discriminator, self._secret.code)
@@ -334,6 +345,23 @@ class SetupModule(Module):
             elif was is not False:  # unbound now: set-up opens by itself
                 await self._open()
             self._show()
+
+    def _resetting(self) -> bool:
+        """Whether a factory reset began. At start, its news may still wait to be read."""
+        return self.resetting or self._resets.pending > 0
+
+    async def _watch_resets(self) -> None:
+        """A factory reset began: end the session, if one runs, close set-up and keep it
+        closed, so that no app sets up the robot as it is erased."""
+        await self._resets.get()
+        self._resets.close()
+        self.resetting = True
+        apps = list(self._apps)
+        for app in apps:
+            app.cancel()
+        await asyncio.gather(*apps, return_exceptions=True)  # each ends its session
+        await self._close()
+        self._show()
 
     async def _watch_settings(self) -> None:
         """Each time the settings open, read the network again for them."""

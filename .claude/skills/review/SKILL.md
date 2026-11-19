@@ -38,6 +38,7 @@ A failing check is a finding; fix it before reading further.
 - What does a page get on its first connection, before any state, and after a reconnect? Old pages and unknown fields are handled.
 - Schemas are checked through `core/data.py`'s `Schema`, never a bare validator: Python's `$` also matches before a last newline, which JSON Schema's, ECMA-262's, does not, and jsonschema's messages quote the value. A problem is logged and sent, so it names where and the rule broken, never the value, which may be a password or a token.
 - JSON from another side is read with `core/data.py`'s `read_json`, never a bare `json.loads`, which takes NaN, a lone surrogate, a U+0000 and any nesting that its stack allows (ai-platform's ADR-0014). Text the robot sends holds no U+0000 either: a network name with a NUL byte goes as `ssid_hex`.
+  - A file at a path the robot reads is another side too: anything may be there. `json.loads` raises `RecursionError` on deep nesting, which no `except ValueError` catches, and the robot then stops at its start.
 - A check made after parsing misses what the parser dropped: `json` keeps only the last value of a repeated name, so a U+0000 in the first passed unseen. `read_json` refuses repeated names (ADR-0014, decision 4). What the robot sends goes through `write_json`, so that the other side can read it.
 - A JSON value from another side may be a list or an object: `value in a_frozenset` then raises `TypeError`. Check that it is a string first.
 - Work on another side's text must take time in proportion to its length:
@@ -53,6 +54,7 @@ A failing check is a finding; fix it before reading further.
 - Text from another side reaches a log only once a schema has passed it, or quoted with `%r`: a line break in it would start a forged log line. What the robot remembers per kind or per sender (`MAX_WARNED`) is bounded.
 - An error replies to the message it answers whenever that message's `seq` can be read, in a handshake too; only an unreadable message's error has no `reply_to`.
 - To whom a message goes: a link that serves several peers sends each answer to its own peer only. A characteristic's `Value` reaches every subscriber; check what the transport does, not only what the port says.
+- A WebSocket that drives the robot checks `Origin` against `Host`, as Tornado's `check_origin` does: a page of any site can open one to a local address (RFC 6455, 4.1). A client with no `Origin` is no browser.
 - What a receiver holds is bounded by what was announced, before it appends: count bytes, not fragments, and let an empty fragment cost nothing. Fragments also fit the longest attribute value, 512 bytes, at any MTU.
 
 ### Python modules (`software/src/ai_robot/`)
@@ -65,7 +67,14 @@ A failing check is a finding; fix it before reading further.
 - Hardware values come from the configuration, with no defaults in code.
 - Every hold ends: whatever keeps the robot awake, or a resource held, has an end that comes on its own (an expiry, a time in the data, a grace period), or one that a test shows is always sent. A timer shown without `seconds` once kept the robot awake for good, past its `ends_at`.
 - What a protocol file says applies on every path that shows it: a module's request and the cloud's alike. The vocabulary's flags were read on the cloud's path only.
+- A gate that a message closes is read from the queue too. Modules start in order, then run, so a message published in a later module's `start()` waits unread when the first `run()` acts: check `flag or subscription.pending`. A reset cut short, said at start, would otherwise let set-up open first (ADR-0023).
+- A module that waits for another's answer on the bus names it in `needs`, or bounds the wait: a configuration may leave the other out, and the robot then waits for ever.
+- Awaiting tasks it cancelled, a task gathers them with `return_exceptions=True`. Suppressing `CancelledError` around the wait also swallows the task's own cancellation, and it runs on after being stopped.
 - A file descriptor has one owner, and every path closes it. One passed over D-Bus is closed once the message has gone: dbus-fast keeps no copy, and only a bus made with `negotiate_unix_fd=True` passes it at all. A socket the event loop reads or writes (`add_reader`, `sock_sendall`) is non-blocking, which asyncio's debug mode checks. A test counts the open descriptors (`/proc/self/fd`).
+- A file whose being there acts (a record, a flag) acts only on its own content, read strictly; anything else at its path is logged by the path and does nothing. A test writes junk, an empty file and a folder there.
+- A write that must outlast a power cut syncs the file, then its folder and each folder it made, after the rename (fsync(2)): `json_file.write` does. `os.replace` alone may leave the old entry on the disk.
+- Nothing kept replays an action: kept settings are values, and an action comes only from a press (`SettingPressed`). A test keeps an action's name in the settings file.
+- A list of paths that the robot erases is checked, when the robot starts, against what the robot owns: `~`, `/`, or a folder named as the robot's that holds the home folder, are refused.
 
 ### Renderer (`ui/src/`)
 
@@ -75,11 +84,13 @@ A failing check is a finding; fix it before reading further.
 - Text is measured with the font it is drawn with (`text.js`) and cut by characters (`clip`), not by UTF-16 units.
 - The glow is costly: static shapes go through `cached()` (`scenes/kit.js`); look for blurred shapes redrawn every frame.
 - Modules keep to the import and export forms `ui/tools/single_file.py` lists.
+- A test page that reports no result failed to load: a syntax error, such as a `const` declared twice in one scope, stops the module before any check. `node --check` a copy of each changed file, named `.mjs`.
 - What the page holds for the robot (a wake lock, a panel) goes when its link does, at once or after a grace period: a page that lost its link kept the screen lit for good.
 
 ### System services and the Pi's set-up (`adapters/`, `tools/pi/`)
 
 - A change that relies on how a system service behaves (BlueZ, NetworkManager) is checked against the version Ubuntu 26.04 ships, with Ubuntu's patches, not against upstream's newest. It runs on the Pi with as many clients as the feature serves: the fakes model the documented behaviour, not a version's bugs. Two apps at once found that BlueZ 5.85 closed one app's channel when the other left (ADR-0020).
+- A systemd unit or target is read as it is installed on the robot's Pi (`systemctl cat`, `systemctl show -p Wants,Requires`), with its conditions: upstream's page says what it means, not what Ubuntu's units do. Ubuntu's `factory-reset.target` restarts a Pi, which has no EFI, without asking for a reset, and its job is still `done`.
 - A D-Bus signal counts only when its sender is the service's current unique name (`Owner.sent`, `adapters/dbus.py`): a match rule's `sender` filters broadcasts only, and the system bus lets any connection send a signal to the robot alone. The owner is followed through `NameOwnerChanged`, so the robot recovers when the service restarts instead of being restarted with it.
 - Set-up scripts in `tools/pi/` ask for no root: they print the root commands, which the README lists too.
 - A web API that needs the compositor fails silently where the compositor does not offer the protocol. Chromium granted a Screen Wake Lock while Frame offered no `zwp_idle_inhibit_manager_v1`, and the screen turned off anyway (ADR-0021). Check on the Pi that the compositor lists the global, and that the effect happens.

@@ -30,10 +30,12 @@ shutdown_step_timeout = 5.0  # seconds each step of the shutdown may take before
 [modules]
 # Started in this order and stopped in reverse. settings comes before the modules that
 # have settings, so that they apply the owner's choices before they start working.
-# motion comes last, so it is the first to stop: the body is made safe before anything
-# else shuts down.
+# reset comes after cloud, so that its action ends the settings' About section. motion
+# comes last, so it is the first to stop: the body is made safe before anything else
+# shuts down.
 enabled = [
-  "system", "settings", "voice", "vision", "screen", "setup", "cloud", "behavior", "motion",
+  "system", "settings", "voice", "vision", "screen", "setup", "cloud", "reset", "behavior",
+  "motion",
 ]
 
 [modules.system]
@@ -89,6 +91,10 @@ bind_timeout = 120.0  # seconds after set-up the screen waits for the server to 
 # What the QR code holds: {setup} stands for the set-up string. An address around it,
 # once the app has one, lets a phone's camera open the app.
 link = "{setup}"
+
+[modules.reset]
+# The factory reset, from the settings (docs/decisions/0023-factory-reset.md).
+note = 10.0  # seconds the screen says to remove the robot in the app, if it could not leave its home
 
 [modules.screen]
 # Microphone loudness (dBFS) that the face's voice reaction maps to 0 and to 1.
@@ -200,6 +206,7 @@ catalogue_ttl = 60.0  # seconds the cloud may cache the robot's catalogue
 waiting_events = 100  # events kept while the robot is offline; the oldest go first
 start_timeout = 5.0  # seconds the cloud has to start a conversation the robot asks for
 agent_timeout = 10.0  # seconds an agent has to listen, once the robot is in the room
+leave_timeout = 15.0  # seconds the robot waits for the outcome of its leave, before a factory reset
 
 # The robot's identity: an identifier, and the key that proves it to ai-cloud
 # (docs/decisions/0010-device-identity.md). "tpm" keeps them in the robot's TPM, as the pi
@@ -234,6 +241,35 @@ bound = true
 [ports.binding.file]
 # In the robot's state directory (XDG's, in the home of the user who runs it).
 path = "~/.local/state/ai-robot/binding.json"
+
+# How the robot erases itself in a factory reset (docs/decisions/0023-factory-reset.md).
+# "sim" erases nothing and starts the robot again; "files" erases the files and folders
+# below, and starts it again; "systemd" has the robot's image erase its data partition
+# and clear its TPM, then restart it, as the pi profile does.
+[ports.factory_reset]
+adapter = "sim"
+
+[ports.factory_reset.sim]
+pending = false  # true: start as a robot whose reset was cut short
+
+[ports.factory_reset.files]
+record = "~/.local/state/ai-robot/resetting.json"  # says that a reset began, until it is done
+# What it erases: the robot's state directory. A file identity's key file is added in
+# local.toml, where its path is set (local.example.toml). Only what is in a folder named
+# as the record's is the robot's own, and may be listed: ~/.config/ai-robot, for one.
+erase = ["~/.local/state/ai-robot"]
+wifi = false  # true: also forget the networks set-up joined through NetworkManager
+bus = "system"  # the D-Bus NetworkManager is on; tests give another bus's address
+
+[ports.factory_reset.systemd]
+record = "~/.local/state/ai-robot/resetting.json"  # on the data partition, erased with it
+bus = "system"  # the D-Bus systemd is on; tests give another bus's address
+# systemd's factory reset service, which says whether the system can reset now
+# (systemd-factory-reset(8)); tests give another socket.
+varlink = "/run/systemd/io.systemd.FactoryReset"
+# The ID the kernel gives each boot (sd_id128_get_boot(3)): the robot keeps the boot in
+# which it asked for the reset, so that it never asks again if the system did not reset.
+boot_id = "/proc/sys/kernel/random/boot_id"
 
 # The link the app sets the robot up through: Bluetooth LE (platform/protocols/setup/README.md).
 # "bluez": the Pi's Bluetooth, through BlueZ on D-Bus.

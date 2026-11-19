@@ -10,7 +10,7 @@ The renderer also plays a start-up animation of its own when a page opens (the `
 
 ## Connection
 
-- The software serves the renderer's files at `http://<host>:<port>/` (the page `screen.html` at `/`) and the WebSocket at `/ws` on the same address. The page connects to the address it was loaded from.
+- The software serves the renderer's files at `http://<host>:<port>/` (the page `screen.html` at `/`) and the WebSocket at `/ws` on the same address. The page connects to the address it was loaded from. The software refuses a connection from a page of another site, which its browser names in `Origin` (RFC 6455, 4.1), with 403: that page would drive the robot as the owner's finger does.
 - Each WebSocket text frame carries one JSON object with a `type`. A side ignores types and fields it does not know, so either side can add optional fields without breaking the other.
 - Several pages may connect at once (the robot's screen and a developer's browser); each receives every message.
 - The software sends the whole state when a page connects and whenever it changes, and again, unchanged, when a panel is asked for again ([Panels](#panels)). A page that connects before the software has a state receives only `hello`, and the state when there is one. The page keeps no history: if the connection drops, it keeps animating the last state and reconnects, with growing delays up to 5 s.
@@ -64,11 +64,12 @@ The scenes and their data:
 |---|---|
 | `charging` | none: shows the battery from `status`. The software shows it for a few seconds when the robot is plugged in. |
 | `clock` | none: the time of day on the software's clock |
+| `reset` | `state`: `leaving` (the robot leaves its home, so that the app no longer lists it), `not_left` (it could not, being offline: the owner must remove it in the app, and it erases itself anyway a few seconds later) or `erasing`. See [ADR-0023](../../docs/decisions/0023-factory-reset.md). |
 | `setup` | `state`: `code` (the code and its QR code), `connected` (an app is setting the robot up), `connecting` (set up, waiting for the server) or `closed` (not set up: a tap opens set-up). With `code`: `code` (8 digits), `discriminator` (4 hexadecimal digits) and `link` (what the QR code holds, up to 256 characters). See the [set-up protocol](https://github.com/trungnguyen278/ai-platform/blob/main/protocols/setup/README.md), in ai-platform. |
 | `timer` | `ends_at` (Unix time in seconds, on the software's clock, when it rings), `duration` (seconds), `label` (optional, up to 16 characters). The renderer counts down on its own, so the timer is sent once; at zero it pulses until the scene is taken away. |
 | `weather` | `condition` (`clear`, `partly-cloudy`, `cloudy`, `rain`, `storm`, `snow`, `fog`), `temperature`, `unit` (`C` or `F`), `night` (optional, `true` for the moon), `place` (optional, up to 18 characters) |
 
-A scene marked `robot_only` in the vocabulary, `setup`, is the robot's own: the cloud cannot ask for it, so that a set-up code on the screen is always the robot's.
+A scene marked `robot_only` in the vocabulary, `setup` and `reset`, is the robot's own: the cloud cannot ask for it, so that a set-up code or a reset on the screen is always the robot's.
 
 A scene with `keeps_awake_until` in the vocabulary, `timer`, keeps the robot awake while it shows, as something going on, until the time in the field of its data that `keeps_awake_until` names: the timer's `ends_at`, when it rings. The software does not put the robot to sleep under it before then, and counts from then on: a timer left ringing lets the robot sleep a whole "Sleep after" later. A scene whose field is missing, is not a number, or names a time passed, does not keep the robot awake.
 
@@ -118,6 +119,8 @@ A panel is a screen the owner acts on, drawn over the face: the settings, for on
 | `items[].unit` | Shown after a slider's value, such as `%`. Optional. |
 | `items[].choices` | A choice's options: each a `value` and a `label`. |
 | `items[].confirm` | A question the renderer asks before it switches a toggle on, or before a button acts. Optional. |
+| `items[].confirm_lines` | Lines the renderer shows under the question, such as what an action erases. Optional, with `confirm` only. |
+| `items[].confirm_label` | The label of the answer that goes ahead, such as `Erase`; `Yes` without it. Cancel is always the other answer. Optional, with `confirm` only. |
 
 - The renderer shows the panel while `state.panel` is not `null`, over the face, which keeps animating. A panel sent again with the same `name` is updated in place, where the owner left it.
 - A change shows at once. A state that takes it shows the panel with the new value; when the robot refuses it, the software sends the panel again as it is, even if nothing else changed, and the value goes back. While the owner drags a slider, the renderer leaves the slider where the finger is.

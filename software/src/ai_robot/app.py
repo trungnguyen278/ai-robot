@@ -11,10 +11,11 @@ from collections.abc import Coroutine, Iterable, Mapping
 from typing import Any
 
 from ai_robot.adapters import create_adapter
-from ai_robot.core.bus import Bus
+from ai_robot.core.bus import Bus, Subscription
 from ai_robot.core.config import ConfigError, get_table
 from ai_robot.core.factory import create, import_object
 from ai_robot.core.module import Module, ModuleContext, RobotInfo
+from ai_robot.messages import RestartRequested
 from ai_robot.modules import MODULES
 from ai_robot.ports import Port
 
@@ -33,7 +34,8 @@ class ModuleError(Exception):
 class App:
     """The robot: the enabled modules, the adapters of the ports they own, and the bus.
 
-    An App runs once; create a new one to run the robot again.
+    An App runs once; create a new one to run the robot again. A module may ask for that
+    (``RestartRequested``): the App then stops as if stopped, with ``restart`` set.
     """
 
     def __init__(self, config: Mapping[str, Any]) -> None:
@@ -43,6 +45,7 @@ class App:
         self.shutdown_timeout = 0.0  # seconds for each step of the shutdown, once built
         self.adapters: dict[str, Port] = {}
         self.modules: list[Module] = []
+        self.restart = False  # a module asked to start the robot again
         self._built = False
         self._ran = False
 
@@ -97,6 +100,13 @@ class App:
                     )
                 owners[port] = name
 
+        for name, cls in classes.items():
+            missing = [needed for needed in cls.needs if needed not in classes]
+            if missing:
+                raise ConfigError(
+                    f"modules.enabled: {name!r} needs {', '.join(map(repr, missing))}"
+                )
+
         adapters: dict[str, Port] = {}
         for port, owner in owners.items():
             if port not in ports_table:
@@ -120,7 +130,7 @@ class App:
         self._built = True
 
     async def run(self, stop: asyncio.Event) -> None:
-        """Run the robot until ``stop`` is set.
+        """Run the robot until ``stop`` is set, or a module asks for a restart.
 
         Setting ``stop`` also interrupts the startup (opening the adapters, starting the
         modules). If an adapter or a module fails, the robot is stopped the same way and
@@ -135,23 +145,44 @@ class App:
         opened: list[Port] = []
         started: list[Module] = []
         timeout = self.shutdown_timeout
+        halt = asyncio.Event()  # stopped, or asked to restart
+        restarts = self.bus.subscribe(RestartRequested)
+        watchers = [
+            asyncio.create_task(self._until(stop, halt), name="stop"),
+            asyncio.create_task(self._restart_on(restarts, halt), name="restart"),
+        ]
         try:
             startup = asyncio.create_task(self._start(opened, started), name="startup")
-            if not await _until_stopped([startup], stop, timeout):
+            if not await _until_stopped([startup], halt, timeout):
                 return
             log.info("running: %s", ", ".join(module.name for module in self.modules))
             tasks = [
                 asyncio.create_task(_run_module(module), name=f"module {module.name}")
                 for module in self.modules
             ]
-            if await _until_stopped(tasks, stop, timeout):
-                await stop.wait()  # every module has returned: wait until stopped
+            if await _until_stopped(tasks, halt, timeout):
+                await halt.wait()  # every module has returned: wait until stopped
         finally:
+            await _cancel(watchers, timeout)
+            restarts.close()
             for module in reversed(started):
                 await _cleanup(module.stop(), f"stopping module {module.name!r}", timeout)
             for adapter in reversed(opened):
                 await _cleanup(adapter.close(), f"closing {type(adapter).__name__}", timeout)
             log.info("stopped")
+
+    @staticmethod
+    async def _until(stop: asyncio.Event, halt: asyncio.Event) -> None:
+        await stop.wait()
+        halt.set()
+
+    async def _restart_on(
+        self, restarts: Subscription[RestartRequested], halt: asyncio.Event
+    ) -> None:
+        await restarts.get()
+        log.info("restarting, as asked")
+        self.restart = True
+        halt.set()
 
     async def _start(self, opened: list[Port], started: list[Module]) -> None:
         """Open every adapter, then start every module, recording each success."""

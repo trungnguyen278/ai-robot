@@ -29,10 +29,13 @@ from ai_robot.messages import (
     ConversationOffered,
     ConversationToCloud,
     EventOffered,
+    HomeLeft,
     LocaleChanged,
     MicrophonesChanged,
     RegistrationRequested,
     RegistrationSigned,
+    ResetStage,
+    Resetting,
     RobotEvent,
     Setting,
     SettingKind,
@@ -136,6 +139,9 @@ class CloudModule(Module):
     - Settings (docs/decisions/0016): one switch for each safety class, which the owner
       changes at the robot only (SEC-9). The owner's choices apply before the first
       session; ``allowed_classes`` is what they are as shipped.
+    - A factory reset (``Resetting``, docs/decisions/0023-factory-reset.md): the link
+      takes the robot out of its home, and ``HomeLeft`` says whether it could. The
+      binding, which the reset erases, is no longer kept from then on.
     """
 
     owns = ("cloud", "identity", "binding")
@@ -193,6 +199,8 @@ class CloudModule(Module):
         self.registrations = self._subscribe(RegistrationRequested)
         self.locales = self._subscribe(LocaleChanged)
         self.microphones = self._subscribe(MicrophonesChanged)
+        self.resets = self._subscribe(Resetting)
+        self.resetting = False  # a factory reset began: the binding is no longer kept
 
     def _subscribe(self, kind: type[M], maxsize: int = 100) -> Subscription[M]:
         subscription = self.bus.subscribe(kind, maxsize=maxsize)
@@ -245,6 +253,7 @@ class CloudModule(Module):
             tasks.create_task(self._follow(self.registrations, self._register))
             tasks.create_task(self._follow(self.locales, self._on_locale))
             tasks.create_task(self._follow(self.microphones, self._on_microphones))
+            tasks.create_task(self._follow(self.resets, self._on_reset))
             tasks.create_task(self.settings.serve())
             tasks.create_task(self._serve_calls())
             tasks.create_task(self._hear())
@@ -465,6 +474,8 @@ class CloudModule(Module):
 
     async def _keep(self) -> None:
         """Save the binding. If it cannot be saved, the robot goes on with it in memory."""
+        if self.resetting or self.resets.pending:  # erased: nothing of it may come back
+            return
         try:
             await self.store.save(self.binding)
         except OSError as error:
@@ -480,6 +491,16 @@ class CloudModule(Module):
         else:
             self.log.warning("the robot's server does not know it: it must be set up")
         self.bus.publish(BindingChanged(self.robot_id, bound))
+
+    async def _on_reset(self, message: Resetting) -> None:
+        self.resetting = True
+        if message.stage is not ResetStage.LEAVING:
+            return
+        if self.binding.server is None and not self.binding.bound:
+            left = True  # never set up: the robot is in no home
+        else:
+            left = await self.link.leave()
+        self.bus.publish(HomeLeft(left))
 
     async def _register(self, request: RegistrationRequested) -> None:
         """Sign the registration the app asked for, then use the server it names."""

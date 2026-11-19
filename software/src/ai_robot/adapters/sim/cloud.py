@@ -40,7 +40,8 @@ class SimCloud(Cloud):
     conversation or says its own part of one only when told to (``call``, ``begin``,
     ``open_conversation``, ``say``), as tests do. Its server knows the robot,
     whichever it is asked to ``serve``, until a test says otherwise (``forget``,
-    ``recognise``).
+    ``recognise``). It leaves the robot's home at once, as the server forgets it,
+    unless a test makes it unreachable for that (``answers_leave``).
     """
 
     def __init__(self) -> None:
@@ -56,6 +57,8 @@ class SimCloud(Cloud):
         self.identity: Identity | None = None
         self.server: str | None = None  # the server the robot was registered with, if any
         self.knows_robot = True  # set it to False before the robot starts for one not set up
+        self.answers_leave = True  # set it to False for a leave that gets no outcome
+        self.left = False  # whether the robot left its home
         self._requests: asyncio.Queue[ToolCall | CallCancelled] = asyncio.Queue()
         self._statuses: asyncio.Queue[LinkStatus] = asyncio.Queue()
         self._said: asyncio.Queue[CloudPart] = asyncio.Queue()
@@ -147,6 +150,14 @@ class SimCloud(Cloud):
 
     async def conversation(self) -> CloudPart:
         return await self._said.get()
+
+    async def leave(self) -> bool:
+        if not self.answers_leave:
+            return False
+        self.left = True
+        if self.knows_robot:
+            self.forget()
+        return True
 
     def open_conversation(self, conversation: str, *, listen: bool) -> None:
         """Open a conversation, as the cloud would for a reminder."""

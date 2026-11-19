@@ -40,6 +40,8 @@ class Module:
     """One function of the robot: voice, vision, screen, motion, ...
 
     - A module owns the ports named in ``owns``; no other module uses them.
+    - It names in ``needs`` the modules it cannot work without, as one that waits for
+      their answers on the bus: the robot does not start without them.
     - It talks to the other modules only through messages on the bus.
     - Its settings, the ``[modules.<name>]`` table, arrive as keyword arguments of
       ``__init__``, which raises ``ValueError`` for an invalid value.
@@ -52,6 +54,7 @@ class Module:
     """
 
     owns: ClassVar[tuple[str, ...]] = ()
+    needs: ClassVar[tuple[str, ...]] = ()  # modules that must be enabled with this one
 
     def __init__(self, ctx: ModuleContext) -> None:
         self.name = ctx.name

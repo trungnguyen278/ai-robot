@@ -25,6 +25,7 @@ import { Press } from '../src/press.js';
 import { SCENES, sceneSlot, sceneTone } from '../src/scenes/index.js';
 import { ASLEEP, SLEEPY, Sleep } from '../src/sleep.js';
 import { CORNER } from '../src/scenes/kit.js';
+import { STATES as RESET_STATES } from '../src/scenes/reset.js';
 import { CODE_LENGTH, DISCRIMINATOR_LENGTH, LINK_LENGTH, STATES } from '../src/scenes/setup.js';
 import { LABEL_LENGTH } from '../src/scenes/timer.js';
 import { CONDITIONS, PLACE_LENGTH, UNITS } from '../src/scenes/weather.js';
@@ -83,7 +84,7 @@ async function checkVocabulary() {
     check(Object.hasOwn(SCENES, name), name, 'required by the protocol, missing from scenes/');
   }
   // What the scenes accept, against what the protocol says they take.
-  const { weather, timer, setup } = vocabulary.scenes;
+  const { weather, timer, setup, reset } = vocabulary.scenes;
   check(same(Object.keys(CONDITIONS), weather.data.condition.values), 'weather',
     `draws ${Object.keys(CONDITIONS).join(', ')}; the protocol lists ${weather.data.condition.values.join(', ')}`);
   check(same(UNITS, weather.data.unit.values), 'weather', 'units differ from the protocol');
@@ -95,6 +96,8 @@ async function checkVocabulary() {
   check(DISCRIMINATOR_LENGTH === setup.data.discriminator.max_length, 'setup',
     'discriminator length differs from the protocol');
   check(LINK_LENGTH === setup.data.link.max_length, 'setup', 'link length differs from the protocol');
+  check(same(RESET_STATES, reset.data.state.values), 'reset',
+    `draws ${RESET_STATES.join(', ')}; the protocol lists ${reset.data.state.values.join(', ')}`);
   check(same(KINDS, Object.keys(vocabulary.panel_items)), 'panel',
     `draws ${KINDS.join(', ')}; the protocol lists ${Object.keys(vocabulary.panel_items).join(', ')}`);
 }
@@ -335,6 +338,13 @@ function checkSceneText() {
     check(right <= 151, 'weather', `${temperature}°${unit} runs to x=${right.toFixed(1)}`);
   }
 
+  check(joined('reset', { state: 'not_left' }).includes('Remove me in the app'), 'reset',
+    'offline, it must say to remove the robot in the app');
+  check(joined('reset', { state: 'leaving' }).includes('Leaving'), 'reset', 'it must say it leaves');
+  check(joined('reset', { state: 'nonsense' }) === 'Erasing', 'reset', 'an unknown state must read as erasing');
+  check(sceneTone(SCENES.reset, { state: 'not_left' }) === 'orange'
+    && sceneTone(SCENES.reset, { state: 'erasing' }) === 'cyan', 'reset', 'its note must stand out');
+
   const tea = 'Tea time 🍵🍵🍵🍵';
   check(clip(tea, 12) === 'Tea time 🍵🍵🍵' && !/[\uD800-\uDBFF]$/.test(clip(tea, 11)), 'text',
     'clip must count characters, not UTF-16 units');
@@ -470,7 +480,8 @@ const EVERY_KIND = {
       { id: 'a.slider', kind: 'slider', label: 'Slider', value: 40, min: 0, max: 100, step: 10, unit: '%' },
       { id: 'a.choice', kind: 'choice', label: 'Unit', value: 'C',
         choices: [{ value: 'C', label: '°C' }, { value: 'F', label: '°F' }, 'not a choice'] },
-      { id: 'a.button', kind: 'button', label: 'Button', confirm: 'Really?' },
+      { id: 'a.button', kind: 'button', label: 'Button', confirm: 'Really?',
+        confirm_lines: ['It cannot be undone.', 3, ''], confirm_label: 'Erase' },
       { id: 'a.info', kind: 'info', label: 'Info', value: 'text' },
       { id: 'a.info', kind: 'info', label: 'The same id', value: 'again' },
       { id: 'a.dial', kind: 'dial', label: 'An unknown kind' },
@@ -522,6 +533,8 @@ function checkPanel() {
     toggle.click();
     check(actions.length === 0 && !$('.question').hidden && $('.question p')?.textContent === 'Sure?', 'toggle',
       'must ask before it is switched on');
+    check($('.question .yes')?.textContent === 'Yes' && !$('.question .lines'), 'toggle',
+      'a question without lines or a label must have none, and Yes');
     $('.question .no').click();
     check(actions.length === 0 && checked(toggle) === 'false' && $('.question').hidden, 'toggle',
       'Cancel must leave it off');
@@ -569,6 +582,11 @@ function checkPanel() {
     // A button that asks before it acts.
     $('.item.button').click();
     check(actions.length === 0 && $('.question p')?.textContent === 'Really?', 'button', 'must ask before it acts');
+    const said = $$('.question .lines p').map((p) => p.textContent);
+    check(same(said, ['It cannot be undone.']) && $('.question .yes')?.textContent === 'Erase', 'button',
+      'must show the lines of text under its question, and the label of its answer');
+    check($('.question .box')?.getAttribute('aria-describedby') === $('.question .lines')?.id, 'button',
+      'the lines must describe the question');
     $('.question .yes').click();
     const pressed = actions.pop();
     check(pressed?.length === 3 && pressed[1] === 'a.button' && pressed[2] === undefined, 'button',

@@ -3,17 +3,26 @@
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import Any, TypeVar
 
+from ai_robot.core.bus import Message, Subscription
 from ai_robot.core.data import Schema
 from ai_robot.core.module import Module
-from ai_robot.messages import Setting, SettingChanged, SettingKind, SettingOffered
+from ai_robot.messages import (
+    Setting,
+    SettingChanged,
+    SettingKind,
+    SettingOffered,
+    SettingPressed,
+)
 
 # Applies a setting's new value, already checked against its schema, or runs an action
 # (with None). A ValueError means the value cannot be applied: it is logged.
 Handler = Callable[[Any], Awaitable[None]]
+M = TypeVar("M", bound=Message)
 
 
 class SettingsHost:
@@ -31,6 +40,8 @@ class SettingsHost:
         self._handlers: dict[str, Handler] = {}
         self._schemas: dict[str, Schema] = {}
         self._changes = module.bus.subscribe(SettingChanged)
+        self._presses = module.bus.subscribe(SettingPressed)
+        self._one_at_a_time = asyncio.Lock()
 
     def add(self, setting: Setting, handler: Handler | None = None) -> None:
         """Offer ``setting``. A value or an action needs the ``handler`` that applies
@@ -71,37 +82,60 @@ class SettingsHost:
             await self._apply(await self._changes.get())
 
     async def serve(self) -> None:
-        """Apply this module's settings as the owner changes them, one at a time."""
-        async for change in self._changes:
-            await self._apply(change)
+        """Apply this module's settings as the owner changes them, and do its actions as
+        the owner presses them, one at a time."""
+        async with asyncio.TaskGroup() as tasks:
+            tasks.create_task(self._serve(self._changes, self._apply))
+            tasks.create_task(self._serve(self._presses, self._press))
 
     def close(self) -> None:
         self._changes.close()
+        self._presses.close()
+
+    async def _serve(
+        self, subscription: Subscription[M], handle: Callable[[M], Awaitable[None]]
+    ) -> None:
+        async for message in subscription:
+            async with self._one_at_a_time:
+                await handle(message)
 
     async def _apply(self, change: SettingChanged) -> None:
-        handler = self._handlers.get(change.name)
-        if handler is None:
+        setting = self._settings.get(change.name)
+        if setting is None or setting.kind is SettingKind.INFO:
             return
         log = self._module.log
+        if setting.kind is SettingKind.ACTION:  # a value kept for it, or sent as one
+            log.warning("setting %s is an action: only pressing it does it", change.name)
+            return
         schema = self._schemas.get(change.name)
         if schema is not None:
             problem = schema.problem(change.value)
             if problem is not None:
                 log.warning("setting %s: refused %r: %s", change.name, change.value, problem)
-                self._publish(self._settings[change.name])  # the screen shows it as it is
+                self._publish(setting)  # the screen shows it as it is
                 return
-        try:
-            await handler(change.value)
-        except ValueError as error:
-            log.warning("setting %s: cannot apply %r: %s", change.name, change.value, error)
-            self._publish(self._settings[change.name])
-            return
-        except Exception:  # a faulty setting never stops the module
-            log.exception("setting %s failed", change.name)
-            self._publish(self._settings[change.name])
-            return
-        if schema is not None:
+        if await self._run(setting, change.value) and schema is not None:
             self.update(change.name, change.value)
+
+    async def _press(self, press: SettingPressed) -> None:
+        setting = self._settings.get(press.name)
+        if setting is not None and setting.kind is SettingKind.ACTION:
+            await self._run(setting, None)
+
+    async def _run(self, setting: Setting, value: Any) -> bool:
+        """Run the handler of ``setting`` with ``value``; whether it took it."""
+        log = self._module.log
+        try:
+            await self._handlers[setting.name](value)
+        except ValueError as error:
+            log.warning("setting %s: cannot apply %r: %s", setting.name, value, error)
+            self._publish(self._settings[setting.name])
+            return False
+        except Exception:  # a faulty setting never stops the module
+            log.exception("setting %s failed", setting.name)
+            self._publish(self._settings[setting.name])
+            return False
+        return True
 
     def _publish(self, setting: Setting) -> None:
         self._module.bus.publish(SettingOffered(self._module.name, setting))
