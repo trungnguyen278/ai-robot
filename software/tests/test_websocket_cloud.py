@@ -71,6 +71,7 @@ SETTINGS: dict[str, Any] = {
     "waiting_events": 100,
     "start_timeout": 1.0,
     "agent_timeout": 1.0,
+    "leave_timeout": 5.0,
 }
 
 
@@ -152,7 +153,7 @@ def test_the_robot_connects_with_a_token_and_says_what_it_is() -> None:
             (token,) = cloud.tokens
             assert cloud.bearers == [f"Bearer {token}"]
             assert cloud.assertions[0]["aud"] == cloud.endpoint
-            assert said["protocol"] == "3.1"
+            assert said["protocol"] == "3.2"
             assert said["device"]["kind"] == "robot" and said["device"]["model"] == "concept-v0"
             assert said["languages"] == ["vi", "en"] and said["time_zone"] == "Asia/Ho_Chi_Minh"
             assert said["allowed_classes"] == ["informational"]

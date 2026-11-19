@@ -24,11 +24,14 @@ from ai_robot.messages import (
     PanelAction,
     PanelClosed,
     PanelRequest,
+    ResetStage,
+    Resetting,
     ScreenHeld,
     Setting,
     SettingChanged,
     SettingKind,
     SettingOffered,
+    SettingPressed,
     SettingRequested,
     SettingSection,
     SettingsOpened,
@@ -306,6 +309,22 @@ def test_actions_run_and_one_that_leaves_closes_the_panel() -> None:
     asyncio.run(main())
 
 
+def test_a_factory_reset_closes_the_panel_and_keeps_it_closed() -> None:
+    """The owner held the face again as the reset began: its news closes the panel."""
+
+    async def main() -> None:
+        async with running(Robot()) as robot:
+            robot.bus.publish(ScreenHeld(0.5, 0.5))
+            await robot.panel()
+            robot.bus.publish(Resetting(ResetStage.LEAVING))
+            assert await robot.panel() is None
+            robot.bus.publish(ScreenHeld(0.5, 0.5))
+            await asyncio.sleep(0.05)
+            assert robot.panels.pending == 0
+
+    asyncio.run(main())
+
+
 def test_the_owner_closes_the_panel() -> None:
     async def main() -> None:
         async with running(Robot()) as robot:
@@ -329,6 +348,27 @@ def test_kept_values_apply_before_the_modules_run() -> None:
         assert (robot.lamp.on, robot.lamp.brightness) == (False, 30)
         await robot.lamp.stop()
         await robot.settings.stop()
+
+    asyncio.run(main())
+
+
+def test_nothing_but_a_press_does_an_action() -> None:
+    """Not a value kept for it, as a settings file may hold any name, nor one sent."""
+
+    async def main() -> None:
+        store = SimSettingsStore()
+        store.values = {"lamp.blink": None, "lamp.leave": None}
+        async with running(Robot(store)) as robot:
+            robot.bus.publish(SettingChanged("lamp.blink"))
+            robot.bus.publish(SettingChanged("lamp.brightness", 70))  # after it, in order
+            await waiting.until(lambda: robot.lamp.brightness == 70, TIMEOUT)
+            assert robot.lamp.blinks == 0
+            robot.bus.publish(SettingPressed("lamp.brightness"))  # a value: no press
+            robot.bus.publish(ScreenHeld(0.5, 0.5))
+            await robot.panel()
+            robot.act("lamp.blink")
+            await waiting.until(lambda: robot.lamp.blinks == 1, TIMEOUT)
+            assert robot.lamp.brightness == 70  # the press before it changed nothing
 
     asyncio.run(main())
 

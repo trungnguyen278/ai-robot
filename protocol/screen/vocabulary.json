@@ -25,6 +25,17 @@
       "description": "The present time on a dial and in digits, with the date",
       "data": {}
     },
+    "reset": {
+      "description": "The factory reset the owner asked for in the settings, until the robot starts again as a new one (docs/decisions/0023-factory-reset.md)",
+      "robot_only": true,
+      "data": {
+        "state": {
+          "type": "string",
+          "values": ["leaving", "not_left", "erasing"],
+          "description": "leaving: the robot leaves its home; not_left: it could not, so the owner must remove it in the app, and it erases itself anyway; erasing: it erases what it keeps"
+        }
+      }
+    },
     "setup": {
       "description": "Set-up from the app: the code to scan or type, then how set-up is going (protocol/setup/README.md)",
       "robot_only": true,

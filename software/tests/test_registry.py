@@ -28,6 +28,7 @@ EXTRAS = {
     ("setup_link", "bluez"): "dbus_fast",
     ("network", "networkmanager"): "dbus_fast",
     ("time_zone", "timedated"): "dbus_fast",
+    ("factory_reset", "systemd"): "dbus_fast",
     ("display_power", "helper"): "fcntl",  # its helper's ABI is Linux's
 }
 PROFILES = sorted(
@@ -63,6 +64,11 @@ def test_every_port_has_exactly_one_owner() -> None:
             owners[port].append(name)
     assert set(owners) == set(PORT_TYPES)
     assert {port: names for port, names in owners.items() if len(names) > 1} == {}
+
+
+def test_every_module_needs_only_known_modules() -> None:
+    needs = {name: import_object(path).needs for name, path in MODULES.items()}
+    assert {name: needed for name, needed in needs.items() if not set(needed) <= set(MODULES)} == {}
 
 
 def test_messages_are_frozen_dataclasses() -> None:

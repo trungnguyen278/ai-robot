@@ -29,3 +29,5 @@ Each significant decision is a short file: context, decision, alternatives consi
 | [0019](0019-setup-button.md) | Set-up without the touch screen: hold the microphones' mute button | Accepted | 2026-10-29 |
 | [0020](0020-patched-bluez.md) | BlueZ: Ubuntu's package with upstream's fix, until Ubuntu ships it | Accepted | 2026-11-13 |
 | [0021](0021-sleep-and-wake.md) | Sleep and wake: the robot decides, the kiosk turns the screen off and on | Accepted | 2026-11-14 |
+| [0022](0022-a-removed-robot-keeps-its-data.md) | A robot removed in the app keeps its data: only its own reset erases it (PROV-4) | Accepted | 2026-11-12 |
+| [0023](0023-factory-reset.md) | The factory reset: on the robot's screen, leaving its home first, erased by its image | Accepted | 2026-11-19 |

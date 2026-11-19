@@ -17,7 +17,7 @@ import qrcodegen from '../../third_party/qrcodegen/qrcodegen.js';
 import { TAU } from '../math.js';
 import { BACKGROUND, rgba } from '../tones.js';
 import { clip, digits, text } from '../text.js';
-import { CORNER, cached } from './kit.js';
+import { CORNER, cached, spinner } from './kit.js';
 
 export const STATES = Object.freeze(['code', 'connected', 'connecting', 'closed']);
 export const CODE_LENGTH = 8; // digits, as in the protocol's vocabulary
@@ -73,21 +73,6 @@ function drawCard(ctx, link, pixels) {
     c.fill();
   });
   ctx.restore();
-}
-
-/** A ring with a turning arc, centred on x, y: something is going on. */
-function spinner(ctx, x, y, r, t, alpha) {
-  ctx.lineWidth = 6;
-  ctx.lineCap = 'round';
-  ctx.globalAlpha = alpha * 0.2;
-  ctx.beginPath();
-  ctx.arc(x, y, r, 0, TAU);
-  ctx.stroke();
-  ctx.globalAlpha = alpha;
-  ctx.beginPath();
-  const start = TAU * ((t * 0.8) % 1);
-  ctx.arc(x, y, r, start, start + TAU * (0.25 + 0.1 * Math.sin(TAU * t * 0.5)));
-  ctx.stroke();
 }
 
 function drawCode(ctx, data, alpha, pixels) {

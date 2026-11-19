@@ -63,6 +63,15 @@
 # [ports.binding]
 # adapter = "file"
 
+# Reset the robot to its factory settings without the robot's image, as on a computer or
+# a Pi that runs it from this repository: erase its state directory and the key file of
+# its file identity, and forget the Wi-Fi networks set-up joined through NetworkManager.
+# [ports.factory_reset]
+# adapter = "files"
+# [ports.factory_reset.files]
+# erase = ["~/.local/state/ai-robot", "~/.config/ai-robot/identity.json"]
+# wifi = true  # with the networkmanager network
+
 # Tune how the robot behaves, for example a longer smile after a tap:
 # [modules.behavior]
 # happy_seconds = 3.0

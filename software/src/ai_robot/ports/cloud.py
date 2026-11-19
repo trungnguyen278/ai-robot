@@ -418,3 +418,13 @@ class Cloud(Port):
     async def conversation(self) -> CloudPart:
         """Wait for the cloud's next part of a conversation. A conversation that ends,
         whatever ends it, ends with a ``ConversationEnd``."""
+
+    @abstractmethod
+    async def leave(self) -> bool:
+        """Leave the robot's home before its factory reset (platform/protocols/cloud/
+        README.md, ``leave``; docs/decisions/0023-factory-reset.md). The conversation in
+        progress, if any, ends first, and the robot holds no other from then on.
+
+        Returns ``True`` once the robot is out of its home, or was in none; ``False``
+        when no outcome came in time, or the cloud cannot take a leave: the app may
+        still list the robot."""

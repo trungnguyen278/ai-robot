@@ -131,7 +131,7 @@ class CloudSide:
         self.sent = sent
         hello: dict[str, Any] = {
             "type": "hello",
-            "protocol": "3.1",
+            "protocol": "3.2",
             "session": session,
             "resumed": resumed,
             "time": "2026-10-28T03:20:00.310Z",
@@ -217,6 +217,7 @@ class FakeCloud:
     async def stop(self) -> None:
         if self._runner is not None:
             await self._runner.cleanup()
+            self._runner = None
 
     async def connection(self, timeout: float = TIMEOUT) -> CloudSide:
         """The next connection of the robot."""

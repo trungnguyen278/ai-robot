@@ -19,11 +19,13 @@ from ai_robot.messages import (
     PanelAction,
     PanelClosed,
     PanelRequest,
+    Resetting,
     ScreenHeld,
     Setting,
     SettingChanged,
     SettingKind,
     SettingOffered,
+    SettingPressed,
     SettingRequested,
     SettingSection,
     SettingsOpened,
@@ -58,16 +60,19 @@ OPEN = Capability(
 def item_of(setting: Setting) -> PanelItem:
     """How the panel shows ``setting``; ``ValueError`` for a schema it cannot show."""
     common = {"help": setting.help}
+    asked = {
+        "confirm": setting.confirm,
+        "confirm_lines": setting.confirm_lines,
+        "confirm_label": setting.confirm_label,
+    }
     if setting.kind is SettingKind.ACTION:
-        return PanelItem(setting.name, "button", setting.title, confirm=setting.confirm, **common)
+        return PanelItem(setting.name, "button", setting.title, **asked, **common)
     if setting.kind is SettingKind.INFO:
         return PanelItem(setting.name, "info", setting.title, setting.value, **common)
     schema = setting.schema or {}
     kind = schema.get("type")
     if kind == "boolean":
-        return PanelItem(
-            setting.name, "toggle", setting.title, setting.value, confirm=setting.confirm, **common
-        )
+        return PanelItem(setting.name, "toggle", setting.title, setting.value, **asked, **common)
     if kind in ("number", "integer") and "minimum" in schema and "maximum" in schema:
         low, high = schema["minimum"], schema["maximum"]
         step = schema.get("multipleOf", 1 if kind == "integer" else (high - low) / 100)
@@ -104,7 +109,9 @@ class SettingsModule(Module):
       modules run, so that they apply them before anything relies on them.
     - **The panel.** A press held on the face (``ScreenHeld``), or the cloud's
       ``settings.open``, opens it; the owner closes it, or the screen does after a
-      while (``PanelClosed``). An action that leaves, such as opening set-up, closes it.
+      while (``PanelClosed``). An action pressed goes to its module (``SettingPressed``):
+      never from what was kept. An action that leaves, such as opening set-up, closes it.
+      A factory reset (``Resetting``) closes it, and keeps it closed.
     """
 
     owns = ("settings",)
@@ -118,6 +125,7 @@ class SettingsModule(Module):
         self.actions = self._subscribe(PanelAction)
         self.closings = self._subscribe(PanelClosed)
         self.requests = self._subscribe(SettingRequested)
+        self.resets = self._subscribe(Resetting)
         self.capabilities = CapabilityHost(self)
         self.capabilities.add(OPEN, self._open_by_cloud)
         self.own = SettingsHost(self)  # its own lines: the robot's name and software
@@ -128,6 +136,7 @@ class SettingsModule(Module):
         self._schemas: dict[str, Schema] = {}
         self.kept: dict[str, Any] = {}
         self.is_open = False
+        self.resetting = False  # a factory reset began: the panel stays closed
 
     def _subscribe(self, kind: type[M]) -> Subscription[M]:
         subscription = self.bus.subscribe(kind)
@@ -152,6 +161,7 @@ class SettingsModule(Module):
             tasks.create_task(self._follow(self.actions, self._on_action))
             tasks.create_task(self._follow(self.closings, self._on_closed))
             tasks.create_task(self._follow(self.requests, self._on_request))
+            tasks.create_task(self._follow(self.resets, self._on_reset))
             tasks.create_task(self.capabilities.serve())
             tasks.create_task(self.own.serve())
 
@@ -194,9 +204,11 @@ class SettingsModule(Module):
 
     async def _open_by_cloud(self, arguments: Mapping[str, Any]) -> Mapping[str, Any]:
         self._open()
-        return {"open": True}
+        return {"open": self.is_open}
 
     def _open(self) -> None:
+        if self.resetting or self.resets.pending:  # one may wait to be heard, at start
+            return
         if not self.is_open:
             self.is_open = True
             self.log.info("the settings are open")
@@ -219,6 +231,10 @@ class SettingsModule(Module):
             self.log.info("the settings are closed")
             self.bus.publish(PanelRequest(self.name, None))
 
+    async def _on_reset(self, _: Resetting) -> None:
+        self.resetting = True
+        self._close()
+
     async def _on_closed(self, message: PanelClosed) -> None:
         if message.panel == PANEL:
             self._close()
@@ -231,7 +247,7 @@ class SettingsModule(Module):
             self.log.warning("the settings have no item %r to act on", action.item)
             return
         if setting.kind is SettingKind.ACTION:
-            self.bus.publish(SettingChanged(setting.name))
+            self.bus.publish(SettingPressed(setting.name))
             if setting.closes:
                 self._close()
             return

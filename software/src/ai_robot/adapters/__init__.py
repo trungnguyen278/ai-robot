@@ -16,6 +16,7 @@ adapters is selected:
 - ``bluez/``, with dbus-fast: Bluetooth LE, for set-up (Linux);
 - ``networkmanager/``, with dbus-fast: the robot's Wi-Fi (Linux);
 - ``timedated/``, with dbus-fast: the robot's time zone (Linux);
+- ``systemd/``, with dbus-fast: the factory reset of the robot's image (Linux);
 - ``sun/``: sunrise and sunset;
 - ``wake/``: the screen woken by the kiosk's helper, ``ai-robot-wake`` (Linux);
 - later, Picamera2 or the body link.
@@ -89,6 +90,11 @@ ADAPTERS: dict[str, dict[str, str]] = {
     "time_zone": {
         "sim": "ai_robot.adapters.sim.time_zone:SimTimeZone",
         "timedated": "ai_robot.adapters.timedated.time_zone:TimedatedTimeZone",
+    },
+    "factory_reset": {
+        "sim": "ai_robot.adapters.sim.factory_reset:SimFactoryReset",
+        "files": "ai_robot.adapters.files.factory_reset:FileFactoryReset",
+        "systemd": "ai_robot.adapters.systemd.factory_reset:SystemdFactoryReset",
     },
     "drive": {"sim": "ai_robot.adapters.sim.body:SimDriveBase"},
     "joints": {"sim": "ai_robot.adapters.sim.body:SimJoints"},

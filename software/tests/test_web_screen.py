@@ -92,6 +92,42 @@ def test_settings_are_checked(tmp_path: Path) -> None:
         WebScreen(**TIMINGS, host="127.0.0.1", port=70000)
 
 
+@pytest.mark.parametrize(
+    ("origin", "host", "connects"),
+    [
+        (None, None, True),  # no browser's
+        ("{base}", None, True),  # the screen's own page
+        ("http://ROBOT.local:{port}", "robot.LOCAL:{port}", True),
+        ("https://attacker.example", None, False),
+        ("http://127.0.0.1:1", None, False),  # another server on this computer
+        ("null", None, False),  # a page with no origin a browser names, such as a file
+    ],
+)
+def test_only_the_screens_own_page_drives_it(
+    ui_dir: Path, origin: str | None, host: str | None, connects: bool
+) -> None:
+    """A page from another site would drive the robot, as the owner's finger does."""
+
+    async def main() -> None:
+        async with serving(ui_dir) as (screen, base), aiohttp.ClientSession() as session:
+            port = base.rsplit(":", 1)[1]
+            headers = {}
+            if origin is not None:
+                headers["Origin"] = origin.format(base=base, port=port)
+            if host is not None:
+                headers["Host"] = host.format(port=port)
+            if connects:
+                async with session.ws_connect(f"{base}/ws", headers=headers) as page:
+                    assert (await receive(page))["type"] == "hello"
+                return
+            with pytest.raises(aiohttp.WSServerHandshakeError) as refused:
+                await session.ws_connect(f"{base}/ws", headers=headers)
+            assert refused.value.status == 403
+            assert not screen.pages
+
+    asyncio.run(main())
+
+
 def test_serves_the_renderer_and_drives_its_pages(ui_dir: Path) -> None:
     async def main() -> None:
         async with serving(ui_dir) as (screen, base), aiohttp.ClientSession() as session:
@@ -239,7 +275,14 @@ PANEL = Panel(
         PanelSection(
             "Wi-Fi and app",
             (
-                PanelItem("setup.start", "button", "Set up with the app", confirm="Open set-up?"),
+                PanelItem(
+                    "setup.start",
+                    "button",
+                    "Set up with the app",
+                    confirm="Open set-up?",
+                    confirm_lines=("The app finds the robot over Bluetooth.",),
+                    confirm_label="Open",
+                ),
                 PanelItem("setup.network", "info", "Wi-Fi", "Home, connected"),
                 PanelItem(
                     "x.lang",
@@ -299,6 +342,8 @@ def test_a_panel_is_sent_as_the_protocol_has_it(ui_dir: Path) -> None:
                                 "kind": "button",
                                 "label": "Set up with the app",
                                 "confirm": "Open set-up?",
+                                "confirm_lines": ["The app finds the robot over Bluetooth."],
+                                "confirm_label": "Open",
                             },
                             {
                                 "id": "setup.network",
@@ -359,6 +404,11 @@ def test_no_panel_is_null() -> None:
         ({"kind": "button", "value": 1}, "no value"),
         ({"kind": "info", "value": 3}, "text"),
         ({"kind": "info", "value": "x", "confirm": "Sure?"}, "confirmation"),
+        ({"kind": "button", "confirm_lines": ("Gone.",)}, "only a question"),
+        ({"kind": "button", "confirm_label": "Erase"}, "only a question"),
+        ({"kind": "button", "confirm": "Sure?", "confirm_lines": ("",)}, "each line"),
+        ({"kind": "button", "confirm": "Sure?", "confirm_lines": (3,)}, "each line"),
+        ({"kind": "button", "confirm": "Sure?", "confirm_label": ""}, "needs a label"),
     ],
 )
 def test_items_that_are_not_drawable_are_refused(fields: dict[str, Any], problem: str) -> None:

@@ -85,6 +85,12 @@ class Conversations:
         if current is not None:
             await self._leave(current)
 
+    async def end(self, reason: str) -> None:
+        """End the conversation in progress, if any, for ``reason``, telling the cloud
+        and the robot."""
+        if self.current is not None:
+            await self._end(self.current, reason, tell_cloud=True, tell_robot=True)
+
     # ---- the robot's part ----
 
     async def converse(self, part: RobotPart) -> None:
@@ -105,6 +111,9 @@ class Conversations:
     async def _request(self, part: ConversationRequest) -> None:
         if self.current is not None:  # the robot ends one before it asks for another
             await self._end(self.current, "user", tell_cloud=True, tell_robot=False)
+        if self.link.leaving:
+            self._tell(ConversationEnd(part.conversation, "unavailable"))
+            return
         session = self.link.session
         if session is None or self.link.connection is None:
             self._tell(ConversationEnd(part.conversation, "offline"))
@@ -179,6 +188,8 @@ class Conversations:
     def _refusal(self, listen: bool) -> tuple[str, str] | None:
         """Why the robot refuses a conversation the cloud opens, if it does."""
         session, device = self.link.session, self.link.device
+        if self.link.leaving:
+            return "not_allowed", "the robot is leaving its home"
         if session is None or not session.conversations:
             return "not_allowed", "the robot holds no conversations in this session"
         if self.current is not None:

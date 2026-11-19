@@ -76,14 +76,15 @@ class FakeNetworkManager:
         if self.bus is not None:
             self.bus.disconnect()
 
-    def save(self, ssid: bytes, password: str | None) -> str:
-        """Keep a profile for ``ssid``, as one saved earlier."""
+    def save(self, ssid: bytes, password: str | None, user: dict[str, str] | None = None) -> str:
+        """Keep a profile for ``ssid``, as one saved earlier, with ``user`` data if any."""
         path = f"{SETTINGS_PATH}/{next(self._numbers)}"
         security = {} if password is None else {"psk": password}
         self.profiles[path] = {
             "connection": {"id": ssid.decode(errors="replace"), "type": "802-11-wireless"},
             "802-11-wireless": {"ssid": ssid},
             **({"802-11-wireless-security": security} if security else {}),
+            **({"user": {"data": user}} if user is not None else {}),
         }
         return path
 
@@ -213,7 +214,7 @@ class FakeNetworkManager:
 
     @staticmethod
     def _variants(settings: dict[str, dict[str, Any]]) -> dict[str, dict[str, Variant]]:
-        kinds = {bytes: "ay", str: "s", bool: "b", int: "u"}
+        kinds = {bytes: "ay", str: "s", bool: "b", int: "u", dict: "a{ss}"}
         return {
             name: {key: Variant(kinds[type(value)], value) for key, value in group.items()}
             for name, group in settings.items()

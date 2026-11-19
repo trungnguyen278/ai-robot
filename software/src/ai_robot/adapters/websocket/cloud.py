@@ -7,7 +7,8 @@ connection (``connection.py``) it holds a session (``session.py``), which outliv
 lost connection: the robot connects again and resumes it. The cloud calls the robot's
 capabilities over MCP (``mcp.py``), and the robot sends the events the cloud subscribed
 to, and what its owner changes. Conversations are asked for and ended on the session
-(``conversations.py``), and held in a room of their own (``room.py``).
+(``conversations.py``), and held in a room of their own (``room.py``). Before its
+factory reset, the robot leaves its home (``leave``).
 """
 
 from __future__ import annotations
@@ -27,7 +28,13 @@ from typing import Any
 import aiohttp
 
 from ai_robot import software_version
-from ai_robot.adapters.websocket.connection import PROTOCOL, Connection, Ending
+from ai_robot.adapters.websocket.connection import (
+    LEAVE_SINCE,
+    PROTOCOL,
+    Connection,
+    Ending,
+    version,
+)
 from ai_robot.adapters.websocket.conversations import Conversations
 from ai_robot.adapters.websocket.retry import retry_after
 from ai_robot.adapters.websocket.room import ConversationRoom
@@ -95,6 +102,7 @@ class WebSocketCloud(Cloud):
         waiting_events: int,
         start_timeout: float,
         agent_timeout: float,
+        leave_timeout: float,
     ) -> None:
         self.server = check_url("server", server, ("https", "http"))
         self.connect_timeout = positive("connect_timeout", connect_timeout)
@@ -112,6 +120,7 @@ class WebSocketCloud(Cloud):
             raise ValueError(f"catalogue_ttl must not be negative, got {catalogue_ttl}")
         self.start_timeout = positive("start_timeout", start_timeout)
         self.agent_timeout = positive("agent_timeout", agent_timeout)
+        self.leave_timeout = positive("leave_timeout", leave_timeout)
         self.capabilities: dict[str, Capability] = {}
         self.event_kinds: list[EventKind] = []
         self.audio: ConversationAudio | None = None  # offered for conversations, if any
@@ -141,6 +150,10 @@ class WebSocketCloud(Cloud):
         self._reported: LinkStatus | None = None
         self._task: asyncio.Task[None] | None = None
         self._closing = False
+        self._leaving: asyncio.Future[bool] | None = None  # once asked: the leave's outcome
+        self._leave_refusals = 0  # leaves the cloud failed, for the backoff before the next
+        self._asking: asyncio.TimerHandle | None = None  # the next leave, after a refusal
+        self._hurry = asyncio.Event()  # the next attempt to connect skips the backoff
 
     async def open(self) -> None:
         self.schema, self.agent_schema, self._token_schema = await asyncio.to_thread(
@@ -153,6 +166,8 @@ class WebSocketCloud(Cloud):
 
     async def close(self) -> None:
         self._closing = True
+        if self._asking is not None:
+            self._asking.cancel()
         session, connection = self.session, self.connection
         if session is not None and connection is not None:
             with contextlib.suppress(Exception):
@@ -234,6 +249,29 @@ class WebSocketCloud(Cloud):
     async def conversation(self) -> CloudPart:
         return await self._heard.get()
 
+    async def leave(self) -> bool:
+        try:
+            async with asyncio.timeout(self.leave_timeout):
+                if self._leaving is None:
+                    self._leaving = asyncio.get_running_loop().create_future()
+                    log.info("the robot leaves its home")
+                    await self.conversations.end("user")
+                    if self.bound is False:
+                        self._left()  # its server no longer knows it
+                    else:
+                        self._ask_to_leave()
+                        if self.connection is None:
+                            self._hurry.set()
+                return await asyncio.shield(self._leaving)
+        except TimeoutError:
+            log.warning("the robot could not leave its home within %g s", self.leave_timeout)
+            return False
+
+    @property
+    def leaving(self) -> bool:
+        """Whether the robot asked to leave its home: it holds no conversation from then."""
+        return self._leaving is not None
+
     # ---- what the session tells the link ----
 
     def called(self, call: ToolCall) -> None:
@@ -244,6 +282,42 @@ class WebSocketCloud(Cloud):
 
     def heard(self, part: CloudPart) -> None:
         self._heard.put_nowait(part)
+
+    def refused_leave(self, session: Session, code: str) -> None:
+        """The cloud failed to remove the robot from its home: ask again after the
+        backoff, on the session then carried."""
+        session.leave = None
+        self._leave_refusals += 1
+        delay = self._backoff(self._leave_refusals)
+        log.warning(
+            "the cloud could not remove the robot (%s): asking again in %.1f s", code, delay
+        )
+        self._asking = asyncio.get_running_loop().call_later(delay, self._ask_to_leave)
+
+    # ---- leaving ----
+
+    def _ask_to_leave(self) -> None:
+        """Send ``leave`` on the session carried now, unless it holds one already, if the
+        cloud takes it (platform/protocols/cloud/README.md, leave)."""
+        self._asking = None
+        leaving, session = self._leaving, self.session
+        if leaving is None or leaving.done() or session is None or self.connection is None:
+            return
+        if session.leave is not None:
+            return  # sent, and kept until the cloud receives it, across connections
+        if session.protocol < LEAVE_SINCE:
+            log.warning("the cloud speaks the link %d.%d, which has no leave", *session.protocol)
+            leaving.set_result(False)
+            return
+        session.leave = session.send({"type": "leave"})
+
+    def _left(self) -> None:
+        """The robot is out of its home: the outcome of its leave, if it asked."""
+        leaving = self._leaving
+        if leaving is not None and not leaving.done():
+            log.info("the robot left its home")
+            leaving.set_result(True)
+            self._hurry.clear()
 
     # ---- statuses ----
 
@@ -267,6 +341,8 @@ class WebSocketCloud(Cloud):
 
     def _known(self, bound: bool) -> None:
         """The server said whether it knows the robot."""
+        if not bound:
+            self._left()  # a refused token too ends a leave (leave)
         if bound != self.bound:
             self.bound = bound
             self._report()
@@ -312,7 +388,20 @@ class WebSocketCloud(Cloud):
             else:
                 failures += 1
             longest = self.reconnect_max if self.update_required else None
-            await asyncio.sleep(max(wait, self._backoff(failures, longest)))
+            await self._pause(wait, self._backoff(failures, longest))
+
+    async def _pause(self, least: float, backoff: float) -> None:
+        """Wait before the next attempt: ``backoff``, or only ``least``, the Retry-After
+        the robot was given, once it hurries to leave its home (leave)."""
+        loop = asyncio.get_running_loop()
+        since = loop.time()
+        if not self._hurry.is_set():
+            with contextlib.suppress(TimeoutError):
+                async with asyncio.timeout(max(least, backoff)):
+                    await self._hurry.wait()
+        if self._hurry.is_set():
+            self._hurry.clear()
+            await asyncio.sleep(max(0.0, since + least - loop.time()))
 
     def _backoff(self, failures: int, longest: float | None = None) -> float:
         """A random wait before the next attempt: exponential backoff with full jitter,
@@ -369,6 +458,7 @@ class WebSocketCloud(Cloud):
         if answer["resumed"]:
             assert resuming is not None
             session = resuming
+            session.protocol = version(answer["protocol"])
             unreceived = session.unreceived(answer["received"])
             if unreceived is None:
                 log.warning("cannot resume the cloud session %s: too much was lost", session.id)
@@ -380,6 +470,7 @@ class WebSocketCloud(Cloud):
         else:
             await self._forget()
             session = Session(self, answer["session"], next(self._numbers), self.schema)
+            session.protocol = version(answer["protocol"])
             self.session = session
             log.info("cloud session %s open (protocol %s)", session.id, answer["protocol"])
         session.events = frozenset(answer["events"]) & declared
@@ -394,10 +485,13 @@ class WebSocketCloud(Cloud):
             log.info("the cloud accepts the robot's software again")
             self.update_required = False
         self._report()
+        self._ask_to_leave()
         try:
             return await connection.carry(session, answer["ping_interval"])
         finally:
             session.connection = self.connection = None
+            if session.leave is not None and self._leaving is not None:
+                self._hurry.set()  # the leave's answer may be lost with the connection
             self._report()
 
     def _hello(self, device: DeviceInfo, resuming: Session | None) -> dict[str, Any]:
@@ -432,7 +526,7 @@ class WebSocketCloud(Cloud):
         if not ending.by_cloud:
             return 0.0
         log.warning("the cloud ended the session: %s", ending.reason)
-        if ending.reason == "revoked":
+        if ending.reason in ("revoked", "left"):
             self._known(False)
         elif ending.reason == "update_required":
             self._needs_update("the cloud asks for it")

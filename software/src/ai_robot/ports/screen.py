@@ -42,6 +42,8 @@ class PanelItem:
     value: Any = None
     help: str | None = None
     confirm: str | None = None
+    confirm_lines: tuple[str, ...] = ()
+    confirm_label: str | None = None
     minimum: float | None = None
     maximum: float | None = None
     step: float | None = None
@@ -55,6 +57,13 @@ class PanelItem:
             raise ValueError("a panel item needs an id and a label")
         if self.confirm is not None and self.kind not in ("toggle", "button"):
             raise ValueError("only a toggle or a button asks for confirmation")
+        object.__setattr__(self, "confirm_lines", tuple(self.confirm_lines))
+        if (self.confirm_lines or self.confirm_label is not None) and self.confirm is None:
+            raise ValueError(f"{self.id}: only a question has lines or a button")
+        if not all(isinstance(line, str) and line for line in self.confirm_lines):
+            raise ValueError(f"{self.id}: each line under its question is a text")
+        if self.confirm_label is not None and not self.confirm_label:
+            raise ValueError(f"{self.id}: the button that goes ahead needs a label")
         if self.kind == "toggle" and not isinstance(self.value, bool):
             raise ValueError(f"toggle {self.id}: its value is a boolean")
         if self.kind == "slider":

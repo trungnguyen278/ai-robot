@@ -81,6 +81,8 @@ class Session:
         self.schema = schema
         self.events: frozenset[str] = frozenset()  # the events the cloud subscribed to
         self.conversations = False  # whether both sides hold conversations
+        self.protocol = (0, 0)  # the version of the link the cloud speaks, from its hello
+        self.leave: int | None = None  # the number of the robot's leave, while one is asked
         self.sent = 0  # the number of the last message the robot sent
         self.received = 0  # the number of the last message received from the cloud
         self.kept: deque[tuple[int, str]] = deque()  # sent, and not yet received
@@ -225,7 +227,9 @@ class Session:
         elif kind == "conversation.end":
             await conversations.on_end(seq, message)
         elif kind == "error":
-            if not await conversations.on_error(message):
+            if self.leave is not None and message["reply_to"] == self.leave:
+                self.link.refused_leave(self, message["code"])
+            elif not await conversations.on_error(message):
                 # The cloud's text, quoted: a line break in it must not start a log line.
                 log.warning(
                     "the cloud reports %s about message %d: %r",

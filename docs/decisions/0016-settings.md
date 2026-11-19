@@ -1,6 +1,7 @@
 # 0016 — Settings: declared by the modules, shown as a panel on the touch screen
 
 - **Status:** Accepted
+  - Amended by [ADR-0023](0023-factory-reset.md): an action is pressed, never sent again from what was kept.
 - **Date:** 2026-10-25
 
 ## Context
@@ -32,7 +33,7 @@
    Each setting is named after its module (`voice.volume`), belongs to a section, and has a title. The owner applies a change, and checks it against its schema first.
 2. **A `settings` module keeps what the owner chose**, in its `settings` port: a file on the data partition ([ADR-0014](0014-updates.md)), which a factory reset erases.
    - The configuration holds the values as shipped; the kept ones replace them.
-   - It sends the kept values at start, and the owners apply them before anything uses them. The `cloud` module therefore offers the cloud only the classes the owner allowed, from the first session (SEC-9).
+   - It sends the kept values at start, and the owners apply them before anything uses them. Only values: an action is pressed on the panel (`SettingPressed`), so nothing kept does one, whatever the file holds. The `cloud` module therefore offers the cloud only the classes the owner allowed, from the first session (SEC-9).
 3. **The touch screen shows them as a panel, which the software describes**, as it describes scenes. The software sends sections of items: toggles, sliders, choices, buttons and lines of information. The renderer draws them over the face, in HTML, and reports what the owner does. It keeps no settings of its own.
    - Touch targets are at least 48 pixels, Material's guidance, which is above WCAG 2.2's 44 for its enhanced level (2.5.5).
    - Switching on what widens the cloud's reach asks for confirmation.

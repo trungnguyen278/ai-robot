@@ -53,6 +53,7 @@ from ai_robot.ports.cloud import (
 )
 from ai_robot.ports.daylight import Daylight, SunTimes
 from ai_robot.ports.display_power import DisplayPower
+from ai_robot.ports.factory_reset import FactoryReset, Restart
 from ai_robot.ports.identity import Identity
 from ai_robot.ports.image import Color, Image
 from ai_robot.ports.listening import VoiceActivity, WakeWord
@@ -96,6 +97,7 @@ PORT_TYPES: dict[str, type[Port]] = {
     "identity": Identity,
     "binding": BindingStore,
     "settings": SettingsStore,
+    "factory_reset": FactoryReset,
     "setup_link": SetupLink,
     "network": Network,
     "daylight": Daylight,
@@ -135,6 +137,7 @@ __all__ = [
     "DisplayPower",
     "DriveBase",
     "EventKind",
+    "FactoryReset",
     "Frame",
     "Hold",
     "Identity",
@@ -163,6 +166,7 @@ __all__ = [
     "ResponseStart",
     "ResponseStop",
     "ResponseText",
+    "Restart",
     "RobotPart",
     "Safety",
     "SafetyClass",

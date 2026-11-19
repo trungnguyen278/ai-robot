@@ -16,8 +16,9 @@ import math
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
-from aiohttp import WSCloseCode, WSMsgType, web
+from aiohttp import WSCloseCode, WSMsgType, hdrs, web
 
 from ai_robot.core.checks import positive
 from ai_robot.core.data import encode
@@ -82,6 +83,10 @@ def _item_message(item: PanelItem) -> dict[str, Any]:
         message["help"] = item.help
     if item.confirm:
         message["confirm"] = item.confirm
+    if item.confirm_lines:
+        message["confirm_lines"] = list(item.confirm_lines)
+    if item.confirm_label is not None:
+        message["confirm_label"] = item.confirm_label
     if item.kind == "slider":
         message.update(min=item.minimum, max=item.maximum, step=item.step)
         if item.unit:
@@ -101,6 +106,15 @@ def _revision(folder: Path) -> str:
     return digest.hexdigest()[:16]
 
 
+def _from_this_screen(request: web.Request) -> bool:
+    """Whether the page that connects is the screen's own, served from this host and
+    port. A browser says where the page came from (RFC 6455, 4.1, item 8), so that a
+    page from another site is refused; a client with no ``Origin`` is no browser's. As
+    Tornado's ``check_origin`` decides (v6.5.2, read 2026-11-19)."""
+    origin = request.headers.get(hdrs.ORIGIN)
+    return origin is None or urlsplit(origin).netloc.lower() == request.host.lower()
+
+
 async def _no_cache(request: web.Request, response: web.StreamResponse) -> None:
     """Make the browser check for newer files, so that an update shows on reload."""
     response.headers["Cache-Control"] = "no-cache"
@@ -109,7 +123,8 @@ async def _no_cache(request: web.Request, response: web.StreamResponse) -> None:
 class WebScreen(Screen):
     """Serves the renderer and drives it over a WebSocket.
 
-    The screen is at ``http://<host>:<port>/``. ``ui_dir`` is the renderer's folder;
+    The screen is at ``http://<host>:<port>/``, and only its own page drives it: a page
+    from another site cannot connect. ``ui_dir`` is the renderer's folder;
     by default, the ``ui`` folder of this checkout. A page that takes more than
     ``send_timeout`` seconds to accept a message is dropped, and reconnects; one that
     stays silent is found by pings every ``heartbeat`` seconds; closing waits up to
@@ -219,6 +234,9 @@ class WebScreen(Screen):
         return web.FileResponse(self.ui_dir / PAGE)
 
     async def _connect(self, request: web.Request) -> web.WebSocketResponse:
+        if not _from_this_screen(request):  # it would drive the robot: refused (RFC 6455, 4.2.2)
+            log.warning("refused a page from another site")
+            raise web.HTTPForbidden()
         page = web.WebSocketResponse(heartbeat=self.heartbeat, timeout=self.close_timeout)
         await page.prepare(request)
         self.pages[page] = {}

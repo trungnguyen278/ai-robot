@@ -39,8 +39,8 @@ from ai_robot.messages import (
     SceneRequest,
     ScreenPriority,
     ScreenTouched,
-    SettingChanged,
     SettingOffered,
+    SettingPressed,
     SettingsOpened,
 )
 from ai_robot.modules.cloud import CloudModule
@@ -610,7 +610,7 @@ def test_a_bound_robot_opens_set_up_when_asked_but_refuses_a_registration() -> N
             robot.bind(True)
             assert await robot.scene() is None
             robot.bus.publish(ScreenTouched(0.5, 0.5))  # a bound robot does not open on a tap
-            robot.bus.publish(SettingChanged("setup.start"))  # from the settings
+            robot.bus.publish(SettingPressed("setup.start"))  # from the settings
             session = await app.open((await robot.code_shown())["code"])
             assert (await app.ask(session, "info"))["bound"] is True
             refusal = await app.ask(
@@ -929,7 +929,7 @@ def test_the_settings_open_set_up_and_show_the_network() -> None:
                     lines[setting.name] = setting
             robot.bind(True)
             assert await robot.scene() is None
-            robot.bus.publish(SettingChanged("setup.start"))
+            robot.bus.publish(SettingPressed("setup.start"))
             assert (await robot.code_shown())["state"] == "code"
 
     asyncio.run(main())
