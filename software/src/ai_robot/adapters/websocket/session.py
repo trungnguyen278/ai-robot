@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
 import logging
 import time
 from collections import deque
@@ -21,7 +20,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Protocol
 
 from ai_robot.adapters.websocket.mcp import McpServer
-from ai_robot.core.data import Schema, encode
+from ai_robot.core.data import Schema, write_json
 
 if TYPE_CHECKING:
     from ai_robot.adapters.websocket.cloud import WebSocketCloud
@@ -34,6 +33,9 @@ MAX_ERROR = 1024  # characters in an error's message
 
 # How this implementation works, which nobody needs to tune.
 DROP_REPORT = 10.0  # seconds between two reports of dropped messages
+# What a log names once that the robot ignores (kinds of message, senders), at most: the
+# other side chooses them, and remembering each would hold memory without end.
+MAX_WARNED = 32
 
 
 class Carrier(Protocol):
@@ -110,11 +112,20 @@ class Session:
 
     def send(self, message: dict[str, Any]) -> int | None:
         """Number ``message``, keep it until the cloud has received it, and send it now
-        if a connection carries the session. Returns its number, or ``None`` if it is
-        larger than the protocol allows: it is logged, and not sent."""
+        if a connection carries the session. Returns its number, or ``None`` if the cloud
+        cannot take it, which is logged, and not sent: it is not JSON that every side can
+        hold (ai-platform's ADR-0014), or it is larger than the protocol allows."""
         number = self.sent + 1
-        text = encode({"type": message["type"], "seq": number, **message})
-        if len(text) > MAX_MESSAGE:  # encode() writes ASCII only: a byte a character
+        try:
+            text = write_json({"type": message["type"], "seq": number, **message})
+        except ValueError as error:
+            log.error(
+                "a %s message is not JSON that every side can hold (%s): not sent",
+                message["type"],
+                error,
+            )
+            return None
+        if len(text) > MAX_MESSAGE:  # write_json() writes ASCII only: a byte a character
             log.error("a %s message is larger than the protocol allows: not sent", message["type"])
             return None
         self.sent = number
@@ -178,12 +189,6 @@ class Session:
             self._drop(seq)
         return True
 
-    def oversized(self) -> None:
-        """The cloud's next message was larger than the protocol allows, and could not
-        be read: it counts as received, and gets its error."""
-        self.received += 1
-        self.error(self.received, "invalid_message", f"a message larger than {MAX_MESSAGE} bytes")
-
     def _drop(self, seq: int) -> None:
         """Drop the message ``seq``: too many wait their turn. Say so now and then."""
         self._dropped += 1
@@ -221,24 +226,16 @@ class Session:
             await conversations.on_end(seq, message)
         elif kind == "error":
             if not await conversations.on_error(message):
+                # The cloud's text, quoted: a line break in it must not start a log line.
                 log.warning(
-                    "the cloud reports %s about message %d: %s",
+                    "the cloud reports %s about message %d: %r",
                     message["code"],
                     message["reply_to"],
                     message["message"],
                 )
-        elif kind not in self._warned:
+        elif kind not in self._warned and len(self._warned) < MAX_WARNED:
             self._warned.add(kind)
             log.info("ignoring %s messages from the cloud", kind)
-
-
-def parse(text: str) -> Any:
-    """``text`` as JSON; ``ValueError`` if it is not, NaN and Infinity included."""
-    return json.loads(text, parse_constant=_not_json)
-
-
-def _not_json(name: str) -> Any:
-    raise ValueError(f"{name} is not JSON")
 
 
 def instant(when: float) -> str:

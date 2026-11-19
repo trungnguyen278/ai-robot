@@ -8,18 +8,24 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import time
 from collections.abc import AsyncIterator, Sequence
 from datetime import datetime
-from typing import Any
+from typing import Any, ClassVar, cast
 
 import pytest
 import waiting
-from fake_cloud import TIMEOUT, CloudSide, FakeCloud
+from aiohttp import WSMsgType
+from fake_cloud import TIMEOUT, CloudSide, FakeCloud, schema
 
 from ai_robot.adapters.sim.identity import SimIdentity
 from ai_robot.adapters.websocket import cloud as link_module
+from ai_robot.adapters.websocket import mcp as mcp_module
 from ai_robot.adapters.websocket.cloud import WebSocketCloud
+from ai_robot.adapters.websocket.connection import MAX_BYE, Connection, Ending
+from ai_robot.adapters.websocket.retry import retry_after
+from ai_robot.adapters.websocket.session import MAX_MESSAGE, MAX_WARNED
 from ai_robot.ports import (
     CallCancelled,
     Capability,
@@ -146,7 +152,7 @@ def test_the_robot_connects_with_a_token_and_says_what_it_is() -> None:
             (token,) = cloud.tokens
             assert cloud.bearers == [f"Bearer {token}"]
             assert cloud.assertions[0]["aud"] == cloud.endpoint
-            assert said["protocol"] == "3.0"
+            assert said["protocol"] == "3.1"
             assert said["device"]["kind"] == "robot" and said["device"]["model"] == "concept-v0"
             assert said["languages"] == ["vi", "en"] and said["time_zone"] == "Asia/Ho_Chi_Minh"
             assert said["allowed_classes"] == ["informational"]
@@ -582,6 +588,25 @@ def test_the_robot_waits_as_long_as_a_refusal_asks() -> None:
     run(main)
 
 
+def test_the_robot_waits_as_long_as_a_token_refusal_asks() -> None:
+    async def main() -> None:
+        async with robot_and_cloud() as (link, cloud):
+            cloud.refuse_token = (429, "temporarily_unavailable", {"Retry-After": "1"})
+            started = time.monotonic()
+            await link.describe(DEVICE)
+            await link.offer([], [])
+            await until(lambda: cloud.token_refusals == 1)
+            cloud.refuse_token = None
+            side = await cloud.connection()
+            assert time.monotonic() - started >= 0.5  # it asked for 1 s: a wide margin
+            assert cloud.token_refusals == 1
+            await side.next("hello")
+            await side.hello()
+            await status_where(link, online=True, bound=True)  # still set up
+
+    run(main)
+
+
 def test_the_robot_does_not_follow_a_redirect() -> None:
     async def main() -> None:
         async with robot_and_cloud() as (link, cloud):
@@ -596,9 +621,40 @@ def test_the_robot_does_not_follow_a_redirect() -> None:
 
 def test_retry_after_may_be_a_date() -> None:
     later = time.strftime("%a, %d %b %Y %H:%M:%S GMT", time.gmtime(time.time() + 30))
-    assert 25 < (link_module._retry_after({"Retry-After": later}) or 0) <= 30
-    assert link_module._retry_after({"Retry-After": "soon"}) is None
-    assert link_module._retry_after({"Retry-After": "999999999"}) == 86400
+    assert 25 < (retry_after({"Retry-After": later}) or 0) <= 30
+    earlier = time.strftime("%a, %d %b %Y %H:%M:%S GMT", time.gmtime(time.time() - 30))
+    assert retry_after({"Retry-After": earlier}) == 0
+    assert retry_after({"Retry-After": "soon"}) is None
+    assert retry_after({"Retry-After": "7"}) == 7
+    assert retry_after({"Retry-After": "999999999"}) == 86400
+    assert retry_after({}) is None and retry_after(None) is None
+
+
+@pytest.mark.parametrize(
+    ("value", "wait"),
+    [
+        (" 12\t", 12),  # whitespace around a value is not in it
+        ("9" * 5000, 86400),  # more digits than int() takes
+        ("Mon, 31 Dec 9999 23:59:59 -2359", 86400),  # past datetime's last year in UTC
+        # delay-seconds is digits only (RFC 9110, §10.2.3), which int() and float() are not.
+        ("-5", None),
+        ("1_000", None),
+        ("1e3", None),
+        ("+5", None),
+        ("١٢", None),  # Arabic-Indic digits
+        ("²", None),  # a superscript two
+        # Dates that datetime cannot hold.
+        ("Mon, 01 Jan 99999999999999999999 00:00:00 GMT", None),
+        ("Mon, 01 Jan 10000 00:00:00 GMT", None),
+        ("Mon, 01 Jan 0001 00:00:00 +2359", 0),
+        ("Mon, 32 Jan 2026 00:00:00 GMT", None),
+        ("Mon, 01 Jan 2026 00:00:00 +9999", None),
+        ("", None),
+        (" ", None),
+    ],
+)
+def test_retry_after_reads_what_rfc_9110_allows(value: str, wait: float | None) -> None:
+    assert retry_after({"Retry-After": value}) == wait
 
 
 def test_a_cloud_that_does_not_answer_the_hello_gets_a_bye() -> None:
@@ -622,6 +678,11 @@ def test_a_cloud_speaking_another_major_version_gets_a_bye() -> None:
             await side.next("hello")
             await side.hello(protocol="4.0")
             assert await side.next("bye") == {"type": "bye", "reason": "unsupported_protocol"}
+            # A later version may change the hello: its version is read before the rest.
+            side = await cloud.connection()
+            await side.next("hello")
+            await side.send({"type": "hello", "protocol": "4.0"})
+            assert await side.next("bye") == {"type": "bye", "reason": "unsupported_protocol"}
 
     run(main)
 
@@ -636,27 +697,269 @@ def test_invalid_messages_get_an_error_and_the_session_goes_on() -> None:
             bad = await side.send({"type": "mcp", "payload": {"jsonrpc": "1.0"}})
             error = await side.next("error")
             assert (error["reply_to"], error["code"]) == (bad["seq"], "invalid_message")
-            await side.ws.send_str("not JSON")
-            await side.ws.send_bytes(b"\x00")
-            await side.send({"type": "mcp", "seq": "x", "payload": {"jsonrpc": "2.0"}})
-            await side.mcp("server/discover")
-            assert (await side.next("mcp"))["reply_to"] == bad["seq"] + 1
+            odd = await side.send({"type": "No Such Type"})  # a string, with its number
+            error = await side.next("error")
+            assert (error["reply_to"], error["code"]) == (odd["seq"], "invalid_message")
+            asked = await side.mcp("server/discover")
+            assert (await side.next("mcp"))["reply_to"] == asked["seq"]
+            # A number that JSON Schema reads as an integer is a number.
+            side.sent += 1
+            await side.ws.send_str(json.dumps({**asked, "seq": float(side.sent)}))
+            assert (await side.next("mcp"))["reply_to"] == side.sent
 
     run(main)
 
 
-def test_a_message_too_large_is_answered_on_the_next_connection() -> None:
+SECRET = "secret"  # in frames that the robot cannot answer: its bye must not say it
+CANNOT_ANSWER = [
+    pytest.param(b"\x00secret", id="binary"),
+    pytest.param("not JSON, secret", id="not JSON"),
+    pytest.param('{"type": "mcp", "seq": 1, "secret": NaN}', id="NaN"),
+    pytest.param('["mcp", "secret"]', id="not an object"),
+    pytest.param('{"seq": 1, "secret": 1}', id="no type"),
+    pytest.param('{"type": 7, "seq": 1}', id="a type that is no string"),
+    pytest.param('{"type": "mcp", "payload": {"secret": 1}}', id="no number"),
+    *(
+        pytest.param(json.dumps({"type": "mcp", "seq": seq}), id=f"seq {seq!r}")
+        for seq in (0, -1, 1.5, "1", True, None, 2**53)
+    ),
+    pytest.param('{"type": "pong", "secret": 1}', id="a pong that fails"),
+    pytest.param('{"type": "reconnect", "message": 5}', id="a reconnect that fails"),
+    pytest.param('{"type": "hello", "secret": 1}', id="a hello that fails"),
+    pytest.param('{"type": "ping", "x": "secret\\u0000"}', id="U+0000"),
+    pytest.param('{"type": "ping", "secret\\ud800": 1}', id="a lone surrogate"),
+    pytest.param('{"type": "ping", "x": ' + "[" * 64 + '"secret"' + "]" * 64 + "}", id="65 deep"),
+    pytest.param('{"type": "pong", "received": 0, "received": 0}', id="a repeated name"),
+]
+
+
+@pytest.mark.parametrize("frame", CANNOT_ANSWER)
+@pytest.mark.parametrize("first", [False, True], ids=["in a session", "before the hello"])
+def test_a_frame_the_robot_cannot_answer_ends_the_session(frame: str | bytes, first: bool) -> None:
     async def main() -> None:
         async with robot_and_cloud() as (link, cloud):
             side, _ = await connect(link, cloud)
-            huge = {"jsonrpc": "2.0", "method": "notifications/x", "params": {"x": "x" * (1 << 20)}}
-            await side.send({"type": "mcp", "payload": huge})
-            await asyncio.wait_for(side.closed.wait(), TIMEOUT)
+            if first:
+                side, _ = await reconnection(cloud, side)
+            if isinstance(frame, bytes):
+                await side.ws.send_bytes(frame)
+            else:
+                await side.ws.send_str(frame)
+            bye = await side.next("bye")
+            assert bye["reason"] == "invalid_message"
+            assert bye["message"] and SECRET not in bye["message"]  # why, naming no value
             side = await cloud.connection()
-            assert (await side.next("hello"))["resume"]["received"] == 1
-            await side.hello(SESSION, resumed=True, received=0, sent=1)
-            error = await side.next("error")
-            assert (error["reply_to"], error["code"]) == (1, "invalid_message")
+            assert "resume" not in await side.next("hello")  # a new session
+
+    run(main)
+
+
+FORGED = "x\n2026-11-19 01:00:00 CRITICAL a line the cloud wrote"  # in a type
+
+
+@pytest.mark.parametrize(
+    ("first", "logged"),
+    [
+        (
+            {"type": "mcp", "seq": 1, "payload": {"jsonrpc": "2.0", "method": "x"}},
+            "a mcp message came before the cloud's hello",
+        ),
+        ({"type": "ping"}, "a ping message came before the cloud's hello"),
+        ({"type": "pong", "received": 0}, "a pong message came before the cloud's hello"),
+        # A type the schema refuses is the cloud's text, which the log must not hold.
+        ({"type": FORGED, "seq": 1}, "a message came before the cloud's hello: type: breaks"),
+    ],
+    ids=["a numbered message", "a ping", "a pong", "a type that is not valid"],
+)
+def test_a_first_message_that_is_no_hello_gets_a_bye(
+    first: dict[str, Any], logged: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    async def main() -> None:
+        async with robot_and_cloud() as (link, cloud):
+            side, _ = await connect(link, cloud)
+            side, said = await reconnection(cloud, side)
+            assert said["resume"]["session"] == SESSION
+            await side.ws.send_str(json.dumps(first))
+            assert await side.next("bye") == {"type": "bye", "reason": "no_hello"}
+            side = await cloud.connection()
+            assert "resume" not in await side.next("hello")  # the bye ended the session
+
+    run(main)
+    assert logged in caplog.text and "a line the cloud wrote" not in caplog.text
+
+
+def test_a_hello_that_resumes_a_session_the_robot_did_not_name_gets_a_bye() -> None:
+    async def main() -> None:
+        async with robot_and_cloud() as (link, cloud):
+            side, _ = await connect(link, cloud)
+            side, said = await reconnection(cloud, side)
+            assert said["resume"]["session"] == SESSION
+            await side.hello(OTHER_SESSION, resumed=True, received=0)
+            assert await side.next("bye") == {"type": "bye", "reason": "no_hello"}
+            side = await cloud.connection()
+            assert "resume" not in await side.next("hello")  # the bye ended the session
+
+    run(main)
+
+
+@pytest.mark.parametrize("first", [False, True], ids=["in a session", "before the hello"])
+def test_a_bye_from_the_cloud_ends_the_session_whatever_it_holds(first: bool) -> None:
+    async def main() -> None:
+        async with robot_and_cloud() as (link, cloud):
+            side, _ = await connect(link, cloud)
+            if first:
+                side, _ = await reconnection(cloud, side)
+            await side.send({"type": "bye", "reason": "Not A Code"})
+            await asyncio.wait_for(side.closed.wait(), TIMEOUT)
+            assert side.pending() == []  # no bye answers a bye
+            side = await cloud.connection()
+            assert "resume" not in await side.next("hello")
+
+    run(main)
+
+
+def notification(seq: int, size: int) -> str:
+    """An MCP notification numbered ``seq``, of ``size`` bytes."""
+
+    def text(padding: str) -> str:
+        payload = {"jsonrpc": "2.0", "method": "notifications/x", "params": {"x": padding}}
+        return json.dumps({"type": "mcp", "seq": seq, "payload": payload})
+
+    return text("x" * (size - len(text(""))))
+
+
+def test_a_message_as_large_as_the_protocol_allows_is_taken() -> None:
+    async def main() -> None:
+        async with robot_and_cloud() as (link, cloud):
+            side, _ = await connect(link, cloud)
+            side.sent += 1
+            await side.ws.send_str(notification(side.sent, MAX_MESSAGE))
+            asked = await side.mcp("server/discover")
+            assert (await side.next("mcp"))["reply_to"] == asked["seq"]
+
+    run(main)
+
+
+def test_a_message_too_large_ends_the_session() -> None:
+    async def main() -> None:
+        async with robot_and_cloud() as (link, cloud):
+            side, _ = await connect(link, cloud)
+            side.sent += 1
+            await side.ws.send_str(notification(side.sent, MAX_MESSAGE + 1))
+            await asyncio.wait_for(side.closed.wait(), TIMEOUT)
+            assert side.close_code == 1009  # "message too big": no bye can follow
+            side = await cloud.connection()
+            assert "resume" not in await side.next("hello")
+
+    run(main)
+
+
+def test_the_cloud_s_error_reaches_the_log_quoted(caplog: pytest.LogCaptureFixture) -> None:
+    async def main() -> None:
+        async with robot_and_cloud() as (link, cloud):
+            side, _ = await connect(link, cloud)
+            error = {"type": "error", "reply_to": 1, "code": "internal", "message": FORGED}
+            await side.send(error)
+            asked = await side.mcp("server/discover")
+            assert (await side.next("mcp"))["reply_to"] == asked["seq"]
+
+    run(main)
+    assert f"the cloud reports internal about message 1: {FORGED!r}" in caplog.messages
+
+
+def test_the_kinds_of_message_ignored_are_logged_once_and_at_most_max_warned(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def main() -> None:
+        async with robot_and_cloud() as (link, cloud):
+            side, _ = await connect(link, cloud)
+            for kind in [f"other.k{number}" for number in range(MAX_WARNED + 1)] * 2:
+                await side.send({"type": kind})
+            asked = await side.mcp("server/discover")  # after them all: the session goes on
+            assert (await side.next("mcp"))["reply_to"] == asked["seq"]
+
+    with caplog.at_level(logging.INFO, logger="ai_robot.adapters.websocket.session"):
+        run(main)
+    ignored = [line for line in caplog.messages if line.startswith("ignoring other.k")]
+    assert ignored == [
+        f"ignoring other.k{number} messages from the cloud" for number in range(MAX_WARNED)
+    ]
+
+
+def test_a_connection_the_cloud_closes_with_1009_ends_the_session(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def main() -> None:
+        async with robot_and_cloud() as (link, cloud):
+            side, _ = await connect(link, cloud)
+            await side.ws.close(code=1009)  # the robot's message was too large for it
+            side = await cloud.connection()
+            assert "resume" not in await side.next("hello")
+            assert "the cloud ended the session: invalid_message" in caplog.text  # not the robot
+            await side.hello()
+            await side.ws.close(code=1000)  # any other close: the session resumes
+            side = await cloud.connection()
+            assert (await side.next("hello"))["resume"]["session"] == SESSION
+
+    run(main)
+
+
+def test_text_that_is_not_utf_8_ends_the_session() -> None:
+    async def main() -> None:
+        async with robot_and_cloud() as (link, cloud):
+            side, _ = await connect(link, cloud)
+            # send_str() encodes what it sends: the writer sends these bytes as they are.
+            writer = side.ws._writer
+            assert writer is not None
+            await writer.send_frame(b'{"type": "\xff"}', WSMsgType.TEXT)
+            await asyncio.wait_for(side.closed.wait(), TIMEOUT)
+            assert side.close_code == 1007  # aiohttp's, before any bye
+            side = await cloud.connection()
+            assert "resume" not in await side.next("hello")
+
+    run(main)
+
+
+def test_what_the_cloud_cannot_hold_is_not_sent() -> None:
+    async def main() -> None:
+        async with robot_and_cloud() as (link, cloud):
+            side, _ = await connect(link, cloud, capabilities=(FAN,), events=("lamp.changed",))
+            for data in ({"x": "\x00"}, {"x": "\ud800"}, {"x": "x" * (1 << 20)}):
+                await link.emit("lamp.changed", data)
+                call_fan = {"name": "fan.set", "arguments": {"on": True}}
+                asked = await side.mcp("tools/call", call_fan)
+                call = await request(link)
+                assert isinstance(call, ToolCall)
+                await link.reply(call, data=data)
+                answer = await side.next("mcp")  # no event came before it
+                assert answer["reply_to"] == asked["seq"]
+                result = answer["payload"]["result"]
+                assert result["isError"] is True
+                assert result["content"] == [{"type": "text", "text": mcp_module.UNSENDABLE}]
+
+    run(main)
+
+
+def test_a_bye_s_message_fits_the_protocol() -> None:
+    class Socket:
+        closed = False
+        sent: ClassVar[list[str]] = []
+
+        async def send_str(self, text: str) -> None:
+            self.sent.append(text)
+
+        async def close(self) -> None:
+            self.closed = True
+
+    async def main() -> None:
+        socket = Socket()
+        connection = Connection(cast(Any, socket), schema("from_device"), TIMEOUT)
+        ending = Ending(greeted=True, reason="invalid_message", message="ồ" * (MAX_BYE + 1))
+        assert await connection.end(ending) is ending
+        (said,) = socket.sent
+        bye = json.loads(said)
+        assert bye["message"] == "ồ" * MAX_BYE  # characters, not bytes
+        assert schema("from_device").problem(bye) is None and socket.closed
 
     run(main)
 

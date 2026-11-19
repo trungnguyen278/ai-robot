@@ -51,8 +51,12 @@ def plain(value: Any) -> Any:
 # most this deep, the outermost counted.
 JSON_DEPTH = 64
 
-# What nests in a JSON text, found past its strings: a string, or a bracket.
-_NESTING = re.compile(r'"[^"\\]*(?:\\.[^"\\]*)*"|[\[\]{}]')
+# What nests in a JSON text, found past its strings: a string, or a bracket. A string
+# without its closing quote runs to the end of the text, which is no JSON then, so that
+# each character is read once: a pattern that needed the closing quote would try again
+# from each escaped quote, in time that grows with the square of the text's length (two
+# hours for 1 MiB on the Pi, 2026-11-19). ai-cloud reads strings with the same pattern.
+_NESTING = re.compile(r'"[^"\\]*(?:\\.[^"\\]*)*"?|[\[\]{}]')
 # What no side can hold in a name or a string (ADR-0014): U+0000, and a lone surrogate,
 # which UTF-8 cannot encode. ``json`` joins an escaped pair into the code point it spells.
 _UNHOLDABLE = re.compile(r"[\x00\ud800-\udfff]")
@@ -61,10 +65,15 @@ _UNHOLDABLE = re.compile(r"[\x00\ud800-\udfff]")
 def read_json(text: str | bytes) -> Any:
     """``text``, UTF-8 if it is bytes, as JSON that every side can hold (ai-platform's
     ADR-0014): ``ValueError`` for a text that is not JSON, NaN and Infinity included, that
-    nests deeper than ``JSON_DEPTH``, that holds a U+0000 or a lone surrogate, or a number
-    past a double. The nesting is counted before the text is parsed, so that the answer
-    depends on the text, not on where the parser gives up. The error names the rule
-    broken, never the text."""
+    nests deeper than ``JSON_DEPTH``, that holds a U+0000 or a lone surrogate, a number
+    past a double's range, written with a fraction or an exponent or as an integer, or a
+    name twice in an object. The nesting is counted before the text is parsed, so that
+    the answer depends on the text, not on where the parser gives up; so is an integer's
+    range, which ``int`` would take or refuse by its length (``sys.int_info``), and which
+    a reader in JavaScript takes for an infinity. A repeated name is refused, as ADR-0014
+    allows, because ``json`` would keep only its last value: a U+0000 in a value it
+    dropped would pass unseen. ai-cloud reads JSON by the same rules. The error names the
+    rule broken, never the text."""
     if isinstance(text, bytes):
         try:
             text = text.decode("utf-8")
@@ -80,7 +89,13 @@ def read_json(text: str | bytes) -> Any:
         elif bracket in ("]", "}"):
             depth -= 1
     try:
-        value = json.loads(text, parse_constant=_no_constant, parse_float=_double)
+        value = json.loads(
+            text,
+            parse_constant=_no_constant,
+            parse_float=_double,
+            parse_int=_integer,
+            object_pairs_hook=_object,
+        )
     except json.JSONDecodeError:
         raise ValueError("the text is not JSON") from None
     pending = [value]
@@ -96,8 +111,25 @@ def read_json(text: str | bytes) -> Any:
     return value
 
 
+def write_json(value: Any) -> str:
+    """The JSON text of ``value``, as ``encode`` writes it, if every side can hold it
+    (ai-platform's ADR-0014): ``ValueError`` otherwise, naming the rule broken, never the
+    value. What the robot sends, it could read itself (``read_json``)."""
+    text = encode(value)
+    read_json(text)
+    return text
+
+
 def _no_constant(name: str) -> Any:
     raise ValueError(f"{name} is not JSON")
+
+
+def _object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """For ``json.loads``: an object, unless it holds a name twice."""
+    value = dict(pairs)
+    if len(value) != len(pairs):
+        raise ValueError("the text repeats a name in an object")
+    return value
 
 
 def _double(literal: str) -> float:
@@ -105,6 +137,12 @@ def _double(literal: str) -> float:
     if not math.isfinite(number):
         raise ValueError("a number is past a double")
     return number
+
+
+def _integer(literal: str) -> int:
+    # float() reads any number of digits, where int() takes at most sys.int_info's 4,300.
+    _double(literal)
+    return int(literal)
 
 
 def _thaw(value: Any) -> Any:
@@ -142,11 +180,34 @@ def _pattern(
         yield ValidationError("does not match the pattern")
 
 
-# Read-only mappings and tuples pass as JSON objects and arrays, and patterns end where
-# ECMA-262's end.
+_UNIQUE_ITEMS = Draft202012Validator.VALIDATORS["uniqueItems"]
+
+
+def _unique_items(
+    validator: Any, unique: bool, instance: Any, schema: Mapping[str, Any]
+) -> Iterator[ValidationError]:
+    """JSON Schema's ``uniqueItems``, on an array that its own schema's ``maxItems`` and
+    ``items`` allow: any other fails those. jsonschema compares each item with every other
+    when they cannot be sorted: a cloud's hello with 4,000 objects in ``events`` took 16 s
+    on the Pi (2026-11-19). ai-cloud guards it the same way, and the tests check that the
+    protocols bound every such array (tests/test_data.py)."""
+    if not validator.is_type(instance, "array"):
+        return
+    if len(instance) > schema.get("maxItems", len(instance)):
+        return
+    items = schema.get("items")
+    if items is not None and any(
+        next(validator.descend(item, items), None) is not None for item in instance
+    ):
+        return
+    yield from _UNIQUE_ITEMS(validator, unique, instance, schema)
+
+
+# Read-only mappings and tuples pass as JSON objects and arrays, patterns end where
+# ECMA-262's end, and uniqueItems takes no longer than the array's other rules allow.
 _Validator = validators.extend(
     Draft202012Validator,
-    {"pattern": _pattern},
+    {"pattern": _pattern, "uniqueItems": _unique_items},
     type_checker=Draft202012Validator.TYPE_CHECKER.redefine_many(
         {
             "object": lambda _, value: isinstance(value, Mapping),

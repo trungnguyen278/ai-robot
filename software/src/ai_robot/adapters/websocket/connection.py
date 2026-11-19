@@ -1,27 +1,34 @@
 # SPDX-License-Identifier: MIT
 """One connection of the control channel: a WebSocket, from its handshake to its close
-(platform/protocols/cloud/README.md, The control channel and Staying connected)."""
+(platform/protocols/cloud/README.md, The control channel, Staying connected and
+Messages)."""
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import logging
 import random
+import re
 from dataclasses import dataclass
 from typing import Any
 
 import aiohttp
 from aiohttp import WSCloseCode, WSMsgType
 
-from ai_robot.adapters.websocket.session import MAX_MESSAGE, Session, parse
-from ai_robot.core.data import Schema, encode
+from ai_robot.adapters.websocket.session import Session
+from ai_robot.core.data import Schema, encode, read_json, write_json
 
 log = logging.getLogger(__name__)
 
 # Fixed by the protocol (platform/protocols/cloud/README.md, Messages and schema.json).
+PROTOCOL = "3.1"  # the version of the link that the robot speaks
 UNNUMBERED = frozenset({"hello", "ping", "pong", "reconnect", "bye"})
 LARGEST_SEQ = 2**53 - 1  # $defs/seq: what JSON numbers hold exactly
+MAX_BYE = 256  # characters in a bye's message ($defs/short_text)
+UNANSWERABLE = "invalid_message"  # why a session ends over a frame that cannot be answered
+_VERSION = re.compile(r"([0-9]{1,3})\.[0-9]{1,3}")  # $defs/version
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,14 +37,27 @@ class Ending:
 
     - ``greeted``: whether its hello exchange completed, which starts the backoff
       again;
-    - ``reason``: the ``bye`` that ended the session, from either side, if one did; the
-      session cannot resume after it;
-    - ``by_cloud``: whether the cloud said that ``bye``.
+    - ``reason``: why the session ended, from either side, if it did: a ``bye``'s reason,
+      or ``invalid_message`` for a frame that the connection closed over, after which no
+      bye can follow (Messages, Sizes). The session cannot resume after it;
+    - ``by_cloud``: whether the cloud ended the session;
+    - ``message``: what the robot's ``bye`` adds, for the cloud's logs.
     """
 
     greeted: bool
     reason: str | None = None
     by_cloud: bool = False
+    message: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class Message:
+    """A message from the cloud that the robot can read: a JSON object, ``body``, whose
+    ``type`` is a string. ``seq`` is its number, ``None`` for the types that have none."""
+
+    type: str
+    seq: int | None
+    body: dict[str, Any]
 
 
 class Connection:
@@ -46,7 +66,7 @@ class Connection:
     Before it carries a session, the robot says its hello on it (``say``) and reads the
     cloud's (``first``). Then it carries the session (``carry``): it writes what the
     session sends, in order (``write``), reads what the cloud sends, and pings. It
-    closes after the robot's ``bye`` (``finish``).
+    closes after the robot's ``bye`` (``finish``, or ``end``).
     """
 
     def __init__(self, ws: aiohttp.ClientWebSocketResponse, schema: Schema, close_timeout: float):
@@ -60,33 +80,55 @@ class Connection:
         self._warned: set[str] = set()
 
     async def say(self, message: dict[str, Any]) -> None:
-        """Send ``message`` at once, before the connection carries a session."""
-        await self.ws.send_str(encode(message))
+        """Send ``message`` at once, before the connection carries a session.
+        ``ValueError`` if it is not JSON that every side can hold."""
+        await self.ws.send_str(write_json(message))
 
-    async def first(self) -> Any:
-        """The cloud's first message, parsed: ``{}`` if it is not JSON, ``None`` if the
-        connection closed before it."""
-        while True:
-            frame = await self.ws.receive()
-            if frame.type is WSMsgType.TEXT:
-                try:
-                    return parse(frame.data)
-                except ValueError:
-                    return {}
-            if frame.type is not WSMsgType.BINARY:
-                return None
+    async def first(self) -> dict[str, Any] | Ending:
+        """The cloud's hello, valid and of the robot's major version. Otherwise how the
+        connection ends, before its hello exchange completed; ``end`` then says the
+        robot's bye, if it must (The session, hello)."""
+        message = await self._next()
+        if isinstance(message, Ending):
+            return dataclasses.replace(message, greeted=False)
+        if message.type == "bye":
+            return dataclasses.replace(self._cloud_bye(message.body), greeted=False)
+        if message.type == "hello":
+            version = message.body.get("protocol")
+            major = _VERSION.fullmatch(version) if isinstance(version, str) else None
+            if major is not None and int(major[1]) != int(PROTOCOL.split(".")[0]):
+                # Another major's hello need not match this one's schema.
+                log.warning("the cloud speaks the link %s, not %s", version, PROTOCOL)
+                return Ending(greeted=False, reason="unsupported_protocol")
+        failing = self._failing(message)
+        if failing is not None:
+            return dataclasses.replace(failing, greeted=False)
+        if message.type != "hello":
+            # A numbered message's type is the cloud's text until the schema passes it.
+            problem = self.schema.problem(message.body)
+            if problem is None:
+                log.warning("a %s message came before the cloud's hello", message.type)
+            else:
+                log.warning("a message came before the cloud's hello: %s", problem)
+            return Ending(greeted=False, reason="no_hello")
+        return message.body
 
     def write(self, text: str) -> None:
         """Send ``text`` after what was written before it."""
         if self._bye is None:
             self._outbox.put_nowait(text)
 
-    async def finish(self, reason: str) -> None:
-        """Say ``bye`` with ``reason``, after what was written before it, then close."""
+    async def finish(self, reason: str, message: str | None = None) -> None:
+        """Say ``bye`` with ``reason``, and ``message`` if any, after what was written
+        before it, then close. On a connection closed already, the bye goes nowhere: the
+        writer stops, or the send fails, and the reason still ends the session."""
         if self._bye is not None:
             return
         self._bye = reason
-        bye = encode({"type": "bye", "reason": reason})
+        said = {"type": "bye", "reason": reason}
+        if message is not None:
+            said["message"] = message[:MAX_BYE]
+        bye = encode(said)
         if self._writer is None or self._writer.done():
             with contextlib.suppress(Exception):  # the connection may be gone already
                 await self.ws.send_str(bye)
@@ -98,6 +140,13 @@ class Connection:
         # writer may be cancelled with it, its work done.
         await asyncio.wait({self._writer}, timeout=self.close_timeout)
 
+    async def end(self, ending: Ending) -> Ending:
+        """End the connection as ``ending`` says: with the robot's bye, if the robot ends
+        the session. Returns ``ending``."""
+        if ending.reason is not None and not ending.by_cloud:
+            await self.finish(ending.reason, ending.message)
+        return ending
+
     async def carry(self, session: Session, interval: float) -> Ending:
         """Carry ``session`` until the connection ends, pinging every ``interval``
         seconds."""
@@ -108,8 +157,8 @@ class Connection:
         try:
             done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             ending = reading.result() if reading in done else None
-            if ending is not None and ending.reason is not None and not ending.by_cloud:
-                await self.finish(ending.reason)  # the robot ends the session: it says why
+            if ending is not None:
+                await self.end(ending)
             if self._bye is not None:
                 return Ending(greeted=True, reason=self._bye)
             return ending or Ending(greeted=True)
@@ -137,53 +186,35 @@ class Connection:
 
     async def _read(self, session: Session) -> Ending:
         while True:
-            frame = await self.ws.receive()
-            if frame.type is WSMsgType.TEXT:
-                ending = self._take(frame.data, session)
-                if ending is not None:
-                    return ending
-            elif frame.type is WSMsgType.BINARY:
-                self._once("binary", "ignoring binary frames from the cloud")
-            elif frame.type is WSMsgType.ERROR and _too_large(frame.data):
-                # aiohttp stops reading it, and closes the connection: the session goes on
-                # on the next one, where the robot answers it.
-                log.warning("the cloud sent a message larger than %d bytes", MAX_MESSAGE)
-                session.oversized()
-                return Ending(greeted=True)
-            else:  # closed, or failed
-                return Ending(greeted=True)
+            message = await self._next()
+            if isinstance(message, Ending):
+                return message
+            ending = self._take(message, session)
+            if ending is not None:
+                return ending
 
-    def _take(self, text: str, session: Session) -> Ending | None:
+    def _take(self, message: Message, session: Session) -> Ending | None:
         """Take one message from the cloud. Returns how the connection ends, if it does."""
-        try:
-            message = parse(text)
-        except ValueError:
-            self._once("json", "ignoring messages from the cloud that are not JSON")
+        if message.type == "bye":
+            return self._cloud_bye(message.body)
+        if message.seq is not None:
+            if not session.receive(message.seq, message.body):
+                log.warning(
+                    "the cloud's message %d skips a number after %d", message.seq, session.received
+                )
+                return Ending(greeted=True, reason="out_of_sequence")
             return None
-        kind = message.get("type") if isinstance(message, dict) else None
-        if kind in UNNUMBERED:
-            problem = self.schema.problem(message)
-            if problem is not None:  # it has no number for an error to answer
-                log.warning("ignoring a %s message from the cloud: %s", kind, problem)
-                return None
-            if kind == "pong":
-                self._pong_due = False
-                session.acknowledge(message["received"])
-            elif kind == "reconnect":
-                log.info("the cloud asks the robot to connect again")
-                return Ending(greeted=True)
-            elif kind == "bye":
-                return Ending(greeted=True, reason=message["reason"], by_cloud=True)
-            else:
-                self._once(kind, f"ignoring {kind} messages from the cloud now")
-            return None
-        seq = message.get("seq") if isinstance(message, dict) else None
-        if isinstance(seq, bool) or not isinstance(seq, int) or not 1 <= seq <= LARGEST_SEQ:
-            self._once("seq", "ignoring messages from the cloud without a number")
-            return None
-        if not session.receive(seq, message):
-            log.warning("the cloud's message %d skips a number after %d", seq, session.received)
-            return Ending(greeted=True, reason="out_of_sequence")
+        failing = self._failing(message)
+        if failing is not None:
+            return failing
+        if message.type == "pong":
+            self._pong_due = False
+            session.acknowledge(message.body["received"])
+        elif message.type == "reconnect":
+            log.info("the cloud asks the robot to connect again")
+            return Ending(greeted=True)
+        else:
+            self._once(message.type, f"ignoring {message.type} messages from the cloud now")
         return None
 
     async def _ping(self, session: Session, interval: float) -> None:
@@ -197,12 +228,77 @@ class Connection:
             self.write(encode({"type": "ping", "received": session.received}))
             await asyncio.sleep(interval)
 
+    # ---- reading frames ----
+
+    async def _next(self) -> Message | Ending:
+        """The cloud's next message, if the robot can read it; otherwise how the
+        connection ends (Messages, Validation and Sizes)."""
+        frame = await self.ws.receive()
+        if frame.type is WSMsgType.TEXT:
+            try:
+                body = read_json(frame.data)
+            except ValueError as error:
+                return self._cannot_answer(f"not JSON that every side can hold: {error}")
+            if not isinstance(body, dict):
+                return self._cannot_answer("not a JSON object")
+            kind = body.get("type")
+            if not isinstance(kind, str):
+                return self._cannot_answer("no type that is a string")
+            if kind in UNNUMBERED:
+                return Message(kind, None, body)
+            seq = _seq(body)
+            if seq is None:
+                return self._cannot_answer("a numbered type without its number")
+            return Message(kind, seq, body)
+        if frame.type is WSMsgType.BINARY:
+            return self._cannot_answer("a binary frame")
+        if frame.type is WSMsgType.ERROR and isinstance(frame.data, aiohttp.WebSocketError):
+            # aiohttp could not read a frame, and closed the connection with the error's
+            # code: 1009 for a message larger than the protocol allows, 1007 for text that
+            # is not UTF-8. No bye can follow, and the session ends (Messages, Sizes).
+            code = frame.data.code
+            log.warning("the cloud sent a frame that the robot cannot read (%d)", code)
+            return Ending(greeted=True, reason=UNANSWERABLE)
+        if frame.type is WSMsgType.CLOSE and frame.data == WSCloseCode.MESSAGE_TOO_BIG:
+            log.warning("the robot sent the cloud a message larger than it takes")
+            return Ending(greeted=True, reason=UNANSWERABLE, by_cloud=True)
+        return Ending(greeted=True)  # closed, or failed: the session may resume
+
+    def _failing(self, message: Message) -> Ending | None:
+        """How the session ends over ``message``, if it has no number and fails the
+        schema: no error can answer it (Messages, Validation)."""
+        if message.seq is not None:
+            return None
+        problem = self.schema.problem(message.body)
+        return None if problem is None else self._cannot_answer(f"{message.type}: {problem}")
+
+    def _cannot_answer(self, why: str) -> Ending:
+        """End the session over a frame that the robot cannot answer: ``why``, which names
+        no value, goes in the robot's bye (Messages, Validation)."""
+        log.warning("the cloud sent a frame that the robot cannot answer: %s", why)
+        return Ending(greeted=True, reason=UNANSWERABLE, message=why)
+
+    def _cloud_bye(self, bye: dict[str, Any]) -> Ending:
+        """The cloud's bye ends the session, whatever it holds: a reason that the robot
+        cannot read, it takes as ``error``, as it takes one it does not know (Messages)."""
+        problem = self.schema.problem(bye)
+        if problem is not None:
+            log.warning("the cloud's bye is not valid: %s", problem)
+            return Ending(greeted=True, reason="error", by_cloud=True)
+        return Ending(greeted=True, reason=bye["reason"], by_cloud=True)
+
     def _once(self, key: str, text: str) -> None:
         if key not in self._warned:
             self._warned.add(key)
             log.warning(text)
 
 
-def _too_large(error: Any) -> bool:
-    """Whether ``error``, from aiohttp, says that a message was larger than allowed."""
-    return isinstance(error, aiohttp.WebSocketError) and error.code == WSCloseCode.MESSAGE_TOO_BIG
+def _seq(message: dict[str, Any]) -> int | None:
+    """A message's number, if it has one that the schema allows: an integer from 1, which
+    JSON Schema also reads in a number such as ``1.0``."""
+    seq = message.get("seq")
+    if isinstance(seq, float) and seq.is_integer():
+        seq = int(seq)
+    if isinstance(seq, bool) or not isinstance(seq, int) or not 1 <= seq <= LARGEST_SEQ:
+        return None
+    return seq

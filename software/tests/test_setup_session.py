@@ -171,6 +171,8 @@ HELLO = {"type": "hello", "seq": 1, "protocol": "2.1"}
         json.dumps({**HELLO, chr(0xDFFF): 1}).encode(),
         json.dumps({**HELLO, "x": nested(JSON_DEPTH)}).encode(),
         b'{"type": "hello", "seq": 1, "protocol": "2.1", "x": 1e400}',
+        # A repeated name, whose value that json drops would hide a U+0000.
+        b'{"type": "hello", "seq": 1, "protocol": "2.1", "x": "\\u0000", "x": 1}',
     ],
 )
 def test_a_message_that_cannot_be_read_is_answered_with_nothing_to_reply_to(

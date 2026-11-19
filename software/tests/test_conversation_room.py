@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import math
 import os
 import shutil
@@ -30,6 +31,7 @@ from test_websocket_cloud import robot_and_cloud
 from test_websocket_conversations import talking, told
 
 from ai_robot.adapters.websocket.room import PRE_CONNECT_TOPIC, TOPIC, ConversationRoom
+from ai_robot.adapters.websocket.session import MAX_WARNED
 from ai_robot.ports import (
     AudioFormat,
     CloudPart,
@@ -380,3 +382,34 @@ def test_a_room_left_before_it_is_joined_is_never_joined(server: str) -> None:
         assert not room.room.isconnected()
 
     asyncio.run(main())
+
+
+def test_the_kinds_of_message_ignored_are_logged_once_and_at_most_max_warned(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def main() -> None:
+        room = ConversationRoom(
+            conversation=CONVERSATION,
+            url="ws://127.0.0.1:9",  # never joined
+            token="not a token",
+            listen=True,
+            audio=AUDIO,
+            kept=b"",
+            most_kept=10**7,
+            schema=schema("from_agent"),
+            heard=lambda part: None,
+            agent_timeout=TIMEOUT,
+            connect_timeout=TIMEOUT,
+            rate=1000.0,
+            burst=1000,
+            backlog=500,
+        )
+        for kind in [f"other.k{number}" for number in range(MAX_WARNED + 1)] * 2:
+            assert room._part(json.dumps({"type": kind})) is None
+
+    with caplog.at_level(logging.INFO, logger="ai_robot.adapters.websocket.room"):
+        asyncio.run(main())
+    ignored = [line for line in caplog.messages if line.startswith("ignoring other.k")]
+    assert ignored == [
+        f"ignoring other.k{number} messages from the agent" for number in range(MAX_WARNED)
+    ]

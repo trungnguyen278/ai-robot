@@ -31,10 +31,12 @@ INVALID_PARAMS = -32602
 INTERNAL_ERROR = -32603
 UNSUPPORTED_PROTOCOL_VERSION = -32022
 
-TOO_LARGE = "the result is larger than the protocol allows"
+# A result that the cloud cannot take: larger than the protocol allows, or not JSON that
+# every side can hold (ai-platform's ADR-0014).
+UNSENDABLE = "the result is too large for the protocol, or not JSON that every side can hold"
 
 # How the server sends: an MCP message, and the number of the message it answers, if
-# any. It says whether the message went: one larger than the protocol allows does not.
+# any. It says whether the message went: one that the cloud cannot take does not.
 Send = Callable[[dict[str, Any], int | None], bool]
 
 
@@ -117,7 +119,7 @@ class McpServer:
             result.setdefault("resultType", "complete")
             result["_meta"] = {**result.get("_meta", {}), **_server_info()}
             if not self._send({"jsonrpc": "2.0", "id": request, "result": result}, seq):
-                error = {"code": INTERNAL_ERROR, "message": TOO_LARGE}
+                error = {"code": INTERNAL_ERROR, "message": UNSENDABLE}
                 self._send({"jsonrpc": "2.0", "id": request, "error": error}, seq)
 
     def _discover(self, request: Any, params: Mapping[str, Any], seq: int) -> dict[str, Any]:
@@ -204,7 +206,7 @@ class McpServer:
             }
             if self._result(request, result, seq):
                 return
-            error = TOO_LARGE
+            error = UNSENDABLE
         self._result(request, {"content": [{"type": "text", "text": error}], "isError": True}, seq)
 
     def _result(self, request: Any, result: dict[str, Any], seq: int) -> bool:

@@ -6,8 +6,10 @@ from __future__ import annotations
 import json
 import math
 import re
+import time
 from collections.abc import Iterator
 from datetime import date
+from types import MappingProxyType
 from typing import Any
 
 import pytest
@@ -21,6 +23,7 @@ from ai_robot.core.data import (
     frozen,
     plain,
     read_json,
+    write_json,
 )
 
 # The protocols whose schemas the robot reads (platform/protocols/).
@@ -29,6 +32,11 @@ PROTOCOLS = ("cloud", "setup")
 # against Node 24 on 2026-11-03: Python's \d and \w take in every script's digits and letters,
 # and its \s takes U+001C to U+001F and U+0085 where ECMA-262's takes U+FEFF.
 SHORTHANDS = re.compile(r"\\[dDwWsSbB]")
+# How long reading a text of 1 MiB may take, in seconds: about a tenth on this computer,
+# where reading it in time that grew with the square of its length took hours on the Pi.
+QUICK = 2.0
+MEBIBYTE = 1 << 20
+QUOTE, BACKSLASH = '"', chr(92)
 
 
 def test_frozen_is_a_deep_read_only_copy() -> None:
@@ -173,6 +181,7 @@ def nested(levels: int, value: Any = 0) -> Any:
         {"a": ["[" * 100 + '"' + "\\" + "{" * 100, "]"]},  # brackets in strings
         chr(0x1F600),  # a pair of surrogates, once escaped
         {"": [1, -2.5, 1e308, None, True, "x"]},
+        [10**308, -(10**308)],  # integers within a double's range
         nested(JSON_DEPTH),
         [[0]] * (JSON_DEPTH * 2),  # wide, not deep
     ],
@@ -191,15 +200,121 @@ def test_json_every_side_can_hold_is_read(value: Any) -> None:
         ("NaN", "NaN is not JSON"),
         ("[-Infinity]", "Infinity is not JSON"),
         ("[1e999]", "past a double"),
+        ("1" + "0" * 400, "past a double"),  # an integer too, which int() would take
+        ("[-" + "9" * 5000 + "]", "past a double"),  # more digits than int() takes
         ('"secret\\u0000"', "U[+]0000"),
         ('{"a": "secret\\udc00"}', "lone surrogate"),
         ('{"secret\\ud800": 1}', "lone surrogate"),  # in a name
         ('["\\ud800\\ud800"]', "lone surrogate"),  # two highs are no pair
         (json.dumps(nested(JSON_DEPTH + 1)), "deeper than 64"),
         ("[" * (JSON_DEPTH + 1), "deeper than 64"),  # however far a parser would get
+        # A repeated name, whose first value json would drop unseen: a U+0000, a lone
+        # surrogate, or one in a name or an array of the value dropped.
+        ('{"secret": "\\u0000", "secret": "ok"}', "repeats a name"),
+        ('[{"a": "\\ud800", "a": 1}]', "repeats a name"),
+        ('{"a": {"secret\\u0000": 1}, "a": 1}', "repeats a name"),
+        ('{"a": {"b": ["\\u0000"], "b": 1}}', "repeats a name"),
+        ('{"a": 1, "b": 2, "a": 1}', "repeats a name"),  # the same value, apart
     ],
 )
 def test_json_that_not_every_side_can_hold_is_refused(text: str | bytes, rule: str) -> None:
     with pytest.raises(ValueError, match=rule) as refused:
         read_json(text)
     assert "secret" not in str(refused.value)
+
+
+def test_names_that_differ_are_not_repeated() -> None:
+    assert read_json('{"a": {"a": 1}, "A": [{"a": 2}, {"a": 3}]}') == {
+        "a": {"a": 1},
+        "A": [{"a": 2}, {"a": 3}],
+    }
+
+
+def test_what_is_written_every_side_can_hold() -> None:
+    assert write_json(MappingProxyType({"a": (1, "x")})) == '{"a": [1, "x"]}'
+    for value, rule in [
+        ({"secret": "\x00"}, "U[+]0000"),
+        (["secret\ud800"], "lone surrogate"),
+        (nested(JSON_DEPTH + 1), "deeper than 64"),
+        ([math.nan], "Out of range"),
+        ({"secret": 10**400}, "past a double"),
+    ]:
+        with pytest.raises(ValueError, match=rule) as refused:
+            write_json(value)
+        assert "secret" not in str(refused.value)
+    assert read_json(write_json(nested(JSON_DEPTH))) == nested(JSON_DEPTH)
+
+
+# Escaped quotes in a string: each may look like its end to a reader that tries again.
+ESCAPED = QUOTE + (BACKSLASH + QUOTE) * (MEBIBYTE // 2)
+
+
+@pytest.mark.parametrize(
+    ("text", "read"),
+    [
+        (ESCAPED, False),  # no closing quote
+        (ESCAPED + BACKSLASH, False),  # an escape cut off
+        (ESCAPED + BACKSLASH + "\n" + QUOTE, False),  # an escape JSON has not
+        ("[" + ESCAPED + QUOTE + "]", True),
+    ],
+    ids=["unterminated", "a last backslash", "a backslash and a newline", "valid"],
+)
+def test_a_mebibyte_of_text_is_read_at_once(text: str, read: bool) -> None:
+    """A text the size of a message is read in time that grows with its length."""
+    started = time.perf_counter()
+    if read:
+        assert read_json(text) == [ESCAPED[1:].replace(BACKSLASH, "")]
+    else:
+        with pytest.raises(ValueError, match="not JSON"):
+            read_json(text)
+    assert time.perf_counter() - started < QUICK
+
+
+UNIQUE = Schema(
+    "test", {"type": "array", "uniqueItems": True, "maxItems": 3, "items": {"type": "object"}}
+)
+
+
+def test_unique_items_are_checked_on_an_array_the_other_rules_allow() -> None:
+    assert UNIQUE.problem([{"a": 1}, {"a": 2}]) is None
+    assert UNIQUE.problem([{"a": 1}, {"a": 1}]) == "breaks uniqueItems true"
+    # Without maxItems and items, every array is checked.
+    assert Schema("test", {"uniqueItems": True}).problem([{"a": 1}, {"a": 1}]) is not None
+    assert Schema("test", {"uniqueItems": True}).problem(5) is None  # arrays only
+
+
+@pytest.mark.parametrize(
+    ("array", "rule"),
+    [
+        ([{"a": item} for item in range(4000)], "maxItems"),  # each compared with each
+        ([1, 1, {"a": 1}], "type"),  # no uniqueItems before the items pass
+    ],
+    ids=["too many", "items that fail"],
+)
+def test_unique_items_wait_for_the_array_s_other_rules(array: list[Any], rule: str) -> None:
+    started = time.perf_counter()
+    problem = UNIQUE.problem(array)
+    assert problem is not None and rule in problem
+    assert time.perf_counter() - started < QUICK
+
+
+def _unique_arrays(schema: Any) -> Iterator[dict[str, Any]]:
+    if isinstance(schema, dict):
+        if "uniqueItems" in schema:
+            yield schema
+        for value in schema.values():
+            yield from _unique_arrays(value)
+    elif isinstance(schema, list):
+        for value in schema:
+            yield from _unique_arrays(value)
+
+
+@pytest.mark.parametrize("protocol", PROTOCOLS)
+def test_the_protocols_bound_every_array_of_unique_items(protocol: str) -> None:
+    """What ``Schema`` counts on to check ``uniqueItems`` in time: ``maxItems`` and
+    ``items`` beside it, in the same schema."""
+    schema = json.loads((platform_dir() / protocol / "schema.json").read_text(encoding="utf-8"))
+    arrays = list(_unique_arrays(schema))
+    assert arrays
+    for array in arrays:
+        assert "maxItems" in array and "items" in array, array

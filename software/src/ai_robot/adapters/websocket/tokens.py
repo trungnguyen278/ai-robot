@@ -14,7 +14,8 @@ import time
 
 import aiohttp
 
-from ai_robot.core.data import Schema
+from ai_robot.adapters.websocket.retry import retry_after
+from ai_robot.core.data import Schema, read_json
 from ai_robot.core.jose import b64url, b64url_json, thumbprint
 from ai_robot.ports.identity import Identity
 
@@ -23,13 +24,26 @@ TOKEN_PATH = "/device/token"
 GRANT_TYPE = "client_credentials"
 ASSERTION_TYPE = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"  # RFC 7523, §2.2
 TOKEN_TYPE = "bearer"  # the type the robot uses; OAuth 2.0 compares it without case
+NOT_SET_UP = (401, "invalid_client")  # a key the server does not know, or revoked
+# The refusals the protocol names, which a log may name too: no other text from the server.
+REFUSALS = frozenset(
+    {"invalid_client", "invalid_grant", "invalid_request", "temporarily_unavailable"}
+)
 
 # How this implementation works, which nobody needs to tune.
 ASSERTION_SECONDS = 60  # how long an assertion is valid; the protocol allows up to 300
+# The most of an answer the robot reads, as golang.org/x/oauth2 does (internal/token.go,
+# 2026-11-06): a token takes a few kilobytes, and a larger answer is unreadable.
+MAX_ANSWER = 1 << 20  # bytes
 
 
 class NoToken(Exception):
-    """The robot could not get an access token."""
+    """The robot could not get an access token. ``retry_after``, in seconds, is how long
+    the server asked it to wait before it asks again, if it did."""
+
+    def __init__(self, text: str, retry_after: float | None = None) -> None:
+        super().__init__(text)
+        self.retry_after = retry_after
 
 
 class NotSetUp(NoToken):
@@ -81,18 +95,34 @@ async def access_token(
                 f"the token endpoint redirects ({response.status}); the robot does not follow"
             )
         try:
-            answer = await response.json(content_type=None)
+            answer = read_json(await _body(response))  # JSON that every side can hold
         except ValueError:
             answer = None
         if response.status != 200:
             error = answer.get("error") if isinstance(answer, dict) else None
-            if error == "invalid_client":
+            if (response.status, error) == NOT_SET_UP:
                 raise NotSetUp("the server does not know this robot: it must be set up")
-            raise NoToken(f"the server refused the robot's token ({response.status}, {error})")
+            said = error if isinstance(error, str) and error in REFUSALS else "another error"
+            raise NoToken(
+                f"the server refused the robot's token ({response.status}, {said})",
+                retry_after(response.headers),
+            )
     problem = schema.problem(answer)
     if problem is not None:
         raise NoToken(f"the server's answer is not a token: {problem}")
     if answer["token_type"].lower() != TOKEN_TYPE:
-        raise NoToken(f"the server gave a {answer['token_type']!r} token; the robot uses bearer")
+        raise NoToken("the server gave a token of another type; the robot uses bearer")
     token: str = answer["access_token"]
     return token
+
+
+async def _body(response: aiohttp.ClientResponse) -> bytes:
+    """The body of ``response``, unless it is longer than ``MAX_ANSWER``: ``ValueError``
+    then, without reading the rest."""
+    body = bytearray()
+    while len(body) <= MAX_ANSWER:
+        chunk = await response.content.read(MAX_ANSWER + 1 - len(body))
+        if not chunk:
+            return bytes(body)
+        body += chunk
+    raise ValueError(f"the answer is longer than {MAX_ANSWER} bytes")
