@@ -49,7 +49,14 @@ from ai_robot.messages import (
     SettingSection,
     SettingsOpened,
 )
-from ai_robot.ports.network import JoinError, Network, NetworkState, NetworkStatus, Security
+from ai_robot.ports.network import (
+    JoinError,
+    Network,
+    NetworkState,
+    NetworkStatus,
+    Security,
+    shown_name,
+)
 from ai_robot.ports.setup import Connected, Received, SetupLink
 
 SCENE = "setup"  # the screen's set-up scene (protocol/screen/vocabulary.json)
@@ -383,8 +390,10 @@ class SetupModule(Module):
             return "Connecting"
         if status.state is not NetworkState.CONNECTED or status.ssid is None:
             return "Not connected"
-        name = status.ssid.decode("utf-8", errors="replace")
-        return f"{name}, no Internet" if status.internet is False else f"{name}, connected"
+        name = shown_name(status.ssid)
+        if status.internet is False:
+            return f"{name}, no Internet" if name else "No Internet"
+        return f"{name}, connected" if name else "Connected"
 
     async def _watch_touches(self) -> None:
         while True:

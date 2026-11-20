@@ -125,7 +125,7 @@ Install with `-e` from this checkout, cloned with its submodule (`git clone --re
 
 ### The screen
 
-While the robot runs, its screen is at <http://127.0.0.1:8770/>: open it in a browser to watch the face follow the robot. On the robot, Chromium shows that page full screen (kiosk mode). The page is the renderer in [`ui/`](../ui/README.md); the `screen` module decides what it shows, over the [screen protocol](../protocol/screen/README.md).
+While the robot runs, its screen is at <http://127.0.0.1:8770/>: open it in a browser to watch the face follow the robot. On the robot, Chromium shows that page full screen (kiosk mode). The screen answers only to an IP address, `localhost`, the computer's `<hostname>.local` and the names listed in `allowed_hosts` (`[ports.screen.web]`), so that a web page of another site cannot reach it by a name pointed at the robot (DNS rebinding); with `host = "0.0.0.0"` in `local.toml`, list there any other name the computer is reached by. No page may show it in a frame (`frame-ancestors 'none'`), where another site could lay it under a decoy. The page is the renderer in [`ui/`](../ui/README.md); the `screen` module decides what it shows, over the [screen protocol](../protocol/screen/README.md).
 
 The robot sleeps after "Sleep after" minutes with nothing going on, a setting of the screen's (1, 2, 5, 10 or 30 minutes, or never; 5 as shipped). Its face grows sleepy and closes its eyes, and then the kiosk turns the screen off ([ADR-0021](../docs/decisions/0021-sleep-and-wake.md)):
 - **Nothing counts** during a conversation, while a scene that keeps the robot awake shows (set-up's, and the timer until it rings), or while a panel is open.

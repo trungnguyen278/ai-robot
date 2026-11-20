@@ -172,6 +172,12 @@ adapter = "web"
 # to watch it from another device, set host = "0.0.0.0" in local.toml.
 host = "127.0.0.1"
 port = 8770
+# Host names the screen answers to, besides IP addresses, localhost and this computer's
+# own mDNS name (<hostname>.local), which always pass. ".example.lan" allows that name and
+# those under it. Any other name is refused, so that a web page of another site cannot
+# reach the screen, and drive the robot, by a name that its owner points at the robot's
+# address (DNS rebinding). Add the names a machine is reached by in local.toml.
+allowed_hosts = []
 send_timeout = 1.0  # seconds a page may take to accept a message before it is dropped
 heartbeat = 10.0  # seconds between pings that find a page gone silent
 close_timeout = 2.0  # seconds a page may take to acknowledge the end of the connection

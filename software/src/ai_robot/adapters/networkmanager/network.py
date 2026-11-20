@@ -29,6 +29,7 @@ from ai_robot.ports.network import (
     NetworkStatus,
     Security,
     WifiNetwork,
+    shown_name,
 )
 
 log = logging.getLogger(__name__)
@@ -214,10 +215,15 @@ class NetworkManagerNetwork(Network):
         self, ssid: bytes, password: str | None, *, hidden: bool, security: Security | None
     ) -> dict[str, dict[str, Variant]]:
         """A new connection profile. NetworkManager completes what is missing from the
-        access point in sight, such as how its keys are managed."""
+        access point in sight, such as how its keys are managed. The profile is named after
+        the network as a person reads it (``shown_name``): a D-Bus string cannot hold the
+        NUL byte that a network's name may, and NetworkManager, left to name it, would cut
+        the name at that byte, and refuse a name that begins with one as empty
+        (``nm_utils_ssid_to_utf8`` and ``get_new_connection_name``, 1.54, read
+        2026-11-21). A name with no other character is named by its bytes, in hex."""
         settings: dict[str, dict[str, Variant]] = {
             "connection": {
-                "id": Variant("s", ssid.decode("utf-8", errors="replace")),
+                "id": Variant("s", shown_name(ssid) or ssid.hex()),
                 "type": Variant("s", "802-11-wireless"),
                 "autoconnect": Variant("b", True),
             },

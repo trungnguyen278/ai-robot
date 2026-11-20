@@ -30,6 +30,15 @@ class WifiNetwork:
     saved: bool  # whether the robot already knows its password
 
 
+def shown_name(ssid: bytes) -> str:
+    """A network's name as a person reads it: its bytes as UTF-8, what is not UTF-8
+    replaced by U+FFFD, and its NUL bytes left out, which no text the robot sends may hold
+    (ai-platform's ADR-0014). The owner's app shows a name so too (``shownSsid`` in
+    ai-app's ``src/setup/domain/wifi.ts``, with the Encoding Standard's decoder, which
+    replaces as Python's does). The robot names a network by its bytes still."""
+    return ssid.decode("utf-8", errors="replace").replace("\0", "")
+
+
 class NetworkState(StrEnum):
     CONNECTED = "connected"
     CONNECTING = "connecting"
