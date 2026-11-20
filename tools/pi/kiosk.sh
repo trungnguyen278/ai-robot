@@ -99,7 +99,8 @@ prepare() {
 # Each file of tools/pi/kiosk/ that is installed: the file, then where it goes, from /.
 files() {
     printf '%s %s\n' \
-        70-ai-robot-uinput.rules etc/udev/rules.d/70-ai-robot-uinput.rules         70-ai-robot-touchscreen.rules etc/udev/rules.d/70-ai-robot-touchscreen.rules \
+        70-ai-robot-uinput.rules etc/udev/rules.d/70-ai-robot-uinput.rules \
+        70-ai-robot-touchscreen.rules etc/udev/rules.d/70-ai-robot-touchscreen.rules \
         ai-robot-wake.socket "$UNITS/ai-robot-wake.socket" \
         ai-robot-wake.service "$UNITS/ai-robot-wake.service" \
         ai-robot.service "$UNITS/ai-robot.service" \

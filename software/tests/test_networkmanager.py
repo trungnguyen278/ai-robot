@@ -40,6 +40,7 @@ def points() -> list[Any]:
         AccessPoint(b"Secret", 70, flags=1, rsn=PSK, password="hidden one", hidden=True),
         AccessPoint(b"\xff\x00Odd", 10),
         AccessPoint(b"NoDhcp", 15, password=None, dhcp=False),
+        AccessPoint(b"\x00", 5),  # no character a person reads
     ]
 
 
@@ -76,6 +77,7 @@ def test_a_scan_lists_each_network_once_with_its_security(bus: str) -> None:
                 (b"Old", Security.OTHER, 20, False),
                 (b"NoDhcp", Security.OPEN, 15, False),
                 (b"\xff\x00Odd", Security.OPEN, 10, False),
+                (b"\x00", Security.OPEN, 5, False),
             ]
 
     asyncio.run(main())
@@ -120,6 +122,25 @@ def test_a_failed_join_leaves_no_profile(
                 await network.join(ssid, password, hidden=False, security=None, timeout=5.0)
             assert error.value.failure is failure
             assert manager.profiles == {}
+
+    asyncio.run(main())
+
+
+@pytest.mark.parametrize(
+    ("ssid", "name"),
+    [(b"\xff\x00Odd", "\N{REPLACEMENT CHARACTER}Odd"), (b"\x00", "00")],
+)
+def test_joining_a_network_whose_name_is_not_text(bus: str, ssid: bytes, name: str) -> None:
+    """A D-Bus string cannot hold a NUL byte, and NetworkManager would cut the name at one,
+    or refuse it as empty: the profile is named as a person reads the network's name."""
+
+    async def main() -> None:
+        async with started(bus) as (manager, network):
+            status = await network.join(ssid, None, hidden=False, security=None, timeout=5.0)
+            assert (status.state, status.ssid) == (NetworkState.CONNECTED, ssid)
+            (profile,) = manager.profiles.values()
+            assert profile["802-11-wireless"]["ssid"] == ssid
+            assert profile["connection"]["id"] == name
 
     asyncio.run(main())
 

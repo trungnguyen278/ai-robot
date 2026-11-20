@@ -11,9 +11,11 @@
 # [ports.camera]
 # fps = 5.0
 
-# Watch the screen from another device on the network (anyone on it can then see it):
+# Watch the screen from another device on the network (anyone on it can then see it), at
+# this computer's IP address or <hostname>.local, or at another name it has on the network:
 # [ports.screen.web]
 # host = "0.0.0.0"
+# allowed_hosts = ["robot.example.lan"]
 
 # Light the kiosk's screen through its helper with a profile other than pi, such as
 # desktop on a Pi without the robot's hardware (tools/pi/README.md, "The kiosk"):

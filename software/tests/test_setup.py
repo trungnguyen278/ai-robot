@@ -48,6 +48,7 @@ from ai_robot.modules.settings import SettingsModule
 from ai_robot.modules.setup import LINK_LENGTH, SCENE, SetupModule
 from ai_robot.modules.system import SystemModule
 from ai_robot.ports import Binding
+from ai_robot.ports.network import NetworkState, NetworkStatus
 from ai_robot.ports.setup import LinkEvent
 
 TIMEOUT = 5.0
@@ -931,5 +932,47 @@ def test_the_settings_open_set_up_and_show_the_network() -> None:
             assert await robot.scene() is None
             robot.bus.publish(SettingPressed("setup.start"))
             assert (await robot.code_shown())["state"] == "code"
+
+    asyncio.run(main())
+
+
+class NetworkOn(SimNetwork):
+    """The robot is on the network ``ssid``, by its bytes as they came from the air."""
+
+    def __init__(self, ssid: bytes, internet: bool | None) -> None:
+        super().__init__(networks=NETWORKS)
+        self.on = NetworkStatus(NetworkState.CONNECTED, ssid, ADDRESS, internet)
+
+    async def status(self) -> NetworkStatus:
+        return self.on
+
+
+@pytest.mark.parametrize(
+    ("ssid", "internet", "shown"),
+    [
+        (b"Caf\xc3\xa9", True, "Café, connected"),
+        (b"Caf\xc3\xa9", None, "Café, connected"),
+        (b"Home", False, "Home, no Internet"),
+        # What no text the robot sends may hold (ADR-0014) is left out, as the app does:
+        (b"Ho\x00me", True, "Home, connected"),
+        (b"\xff\x00Odd", True, "\N{REPLACEMENT CHARACTER}Odd, connected"),
+        (b"\x00\x00", True, "Connected"),
+        (b"\x00", False, "No Internet"),
+    ],
+)
+def test_the_settings_show_a_networks_name_as_a_person_reads_it(
+    ssid: bytes, internet: bool | None, shown: str
+) -> None:
+    async def main() -> None:
+        robot = Robot()
+        robot.module.network = NetworkOn(ssid, internet)
+        offered = robot.bus.subscribe(SettingOffered)
+        async with running(robot):
+            robot.bus.publish(SettingsOpened())
+            async with asyncio.timeout(TIMEOUT):
+                while True:
+                    setting = (await offered.get()).setting
+                    if setting.name == "setup.network" and setting.value == shown:
+                        break
 
     asyncio.run(main())

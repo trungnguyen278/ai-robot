@@ -10,10 +10,14 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import ipaddress
 import json
 import logging
 import math
+import re
+import socket
 import time
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -41,6 +45,19 @@ log = logging.getLogger(__name__)
 PROTOCOL = 1
 PAGE = "screen.html"
 MAX_NAME = 64  # characters in a panel's or an item's name, as a page reports it
+REFUSED_HOST = (
+    "The robot's screen does not answer to this host name. To reach it by this name, add\n"
+    "the name to allowed_hosts under [ports.screen.web] in software/config/local.toml.\n"
+)
+
+# A Host header as a browser sends it (RFC 9110, 7.2; RFC 3986, 3.2.2), read lowercase: a
+# name or an IPv4 address, or an IPv6 address in brackets, then perhaps a port.
+_HOST = re.compile(
+    r"(?:(?P<name>[a-z0-9_-]+(?:\.[a-z0-9_-]+)*\.?)|\[(?P<ipv6>[0-9a-f:.]+)\])(?::[0-9]*)?"
+)
+# What allowed_hosts lists, read lowercase: a name, or a name after a dot for that name and
+# the names under it.
+_LISTED = re.compile(r"\.?[a-z0-9_-]+(?:\.[a-z0-9_-]+)*\.?")
 
 # src/ai_robot/adapters/web/screen.py -> the ui/ folder of this checkout
 DEFAULT_UI_DIR = Path(__file__).resolve().parents[5] / "ui"
@@ -110,22 +127,116 @@ def _from_this_screen(request: web.Request) -> bool:
     """Whether the page that connects is the screen's own, served from this host and
     port. A browser says where the page came from (RFC 6455, 4.1, item 8), so that a
     page from another site is refused; a client with no ``Origin`` is no browser's. As
-    Tornado's ``check_origin`` decides (v6.5.2, read 2026-11-19)."""
+    Tornado's ``check_origin`` decides (v6.5.2, read 2026-11-19). The host is the one the
+    host check reads (``WebScreen._check_host``)."""
     origin = request.headers.get(hdrs.ORIGIN)
     return origin is None or urlsplit(origin).netloc.lower() == request.host.lower()
 
 
-async def _no_cache(request: web.Request, response: web.StreamResponse) -> None:
-    """Make the browser check for newer files, so that an update shows on reload."""
-    response.headers["Cache-Control"] = "no-cache"
+def _is_address(text: str) -> bool:
+    try:
+        ipaddress.ip_address(text)
+    except ValueError:
+        return False
+    return True
+
+
+def _loopback(host: str) -> bool:
+    """Whether ``host`` is this computer alone: a loopback address, or ``localhost`` or a
+    name under it (RFC 6761, 6.3)."""
+    name = host.lower().removesuffix(".")
+    if name == "localhost" or name.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def own_names(host: str) -> list[str]:
+    """The names this computer answers to on its own network, for a screen that listens on
+    ``host``: its mDNS name, which Avahi makes of the system's host name, up to its first
+    dot, in ``.local`` (avahi-daemon.conf(5); ``avahi_server_new`` in avahi-core/server.c,
+    read 2026-11-21), unless the screen listens on a loopback address, which no other
+    computer reaches; and ``host`` itself, if it is a name rather than an address, as Vite
+    adds its ``server.host``."""
+    names = []
+    label = socket.gethostname().split(".", 1)[0]
+    if label and not _loopback(host):
+        names.append(f"{label}.local")
+    if host and not _is_address(host):
+        names.append(host)
+    return names
+
+
+class Hosts:
+    """The host names the screen answers to, so that no page of another site reaches it by
+    DNS rebinding: a name of the attacker's that points at the robot's address would
+    otherwise get the screen's page and its WebSocket as its own, and drive the robot as
+    the owner's finger does. As Vite's ``server.allowedHosts`` decides (read 2026-11-21),
+    and Django's ``ALLOWED_HOSTS``.
+
+    An IP address always passes, since no name is resolved for it, and so do ``localhost``
+    and the names under it, which resolve to this computer alone (RFC 6761, 6.3), and
+    ``own``, this computer's names (``own_names``). ``listed`` names one host each, or,
+    after a leading dot, a name and those under it. Names match whatever their case, and
+    with or without a final dot."""
+
+    def __init__(self, listed: Sequence[str], own: Iterable[str]) -> None:
+        if isinstance(listed, str) or not all(
+            isinstance(entry, str) and _LISTED.fullmatch(entry.lower()) for entry in listed
+        ):
+            raise ValueError(
+                "allowed_hosts: a list of host names, such as robot.example.lan, or of names "
+                "after a dot, such as .example.lan for that name and those under it"
+            )
+        names = {"localhost"} | {name.lower().removesuffix(".") for name in own}
+        under = [".localhost"]
+        for entry in (entry.lower().removesuffix(".") for entry in listed):
+            names.add(entry.removeprefix("."))
+            if entry.startswith("."):
+                under.append(entry)
+        self.names = frozenset(names)
+        self.under = tuple(under)
+
+    def allow(self, host: str) -> bool:
+        """Whether a request for ``host``, in the form of a ``Host`` header, reaches the
+        screen."""
+        match = _HOST.fullmatch(host.lower())
+        if match is None:
+            return False
+        if match["ipv6"] is not None:
+            return _is_address(match["ipv6"])
+        name = match["name"].removesuffix(".")
+        return _is_address(name) or name in self.names or name.endswith(self.under)
+
+
+# Sent with every response. ``no-cache`` makes the browser check for newer files, so that an
+# update shows on reload. No page may show the screen in a frame: another site would lay it
+# under a decoy, and the owner's finger would drive the robot unawares (clickjacking), as far
+# as resetting it. ``frame-ancestors 'none'`` says so (CSP Level 3), and ``X-Frame-Options:
+# DENY`` in its older form, both sent for defence in depth, as OWASP's Clickjacking Defense
+# Cheat Sheet recommends (read 2026-11-21). Nothing of this project frames the page.
+HEADERS = {
+    "Cache-Control": "no-cache",
+    "Content-Security-Policy": "frame-ancestors 'none'",
+    "X-Frame-Options": "DENY",
+}
+
+
+async def _set_headers(request: web.Request, response: web.StreamResponse) -> None:
+    for name, value in HEADERS.items():
+        response.headers[name] = value
 
 
 class WebScreen(Screen):
     """Serves the renderer and drives it over a WebSocket.
 
-    The screen is at ``http://<host>:<port>/``, and only its own page drives it: a page
-    from another site cannot connect. ``ui_dir`` is the renderer's folder;
-    by default, the ``ui`` folder of this checkout. A page that takes more than
+    The screen is at ``http://<host>:<port>/``, and only its own page drives it: it
+    answers only to an IP address, ``localhost``, this computer's names and those in
+    ``allowed_hosts`` (``Hosts``); a page from another site cannot connect, nor show the
+    screen in a frame (``HEADERS``). ``ui_dir`` is the renderer's folder; by default, the
+    ``ui`` folder of this checkout. A page that takes more than
     ``send_timeout`` seconds to accept a message is dropped, and reconnects; one that
     stays silent is found by pings every ``heartbeat`` seconds; closing waits up to
     ``close_timeout`` seconds.
@@ -139,6 +250,7 @@ class WebScreen(Screen):
         send_timeout: float,
         heartbeat: float,
         close_timeout: float,
+        allowed_hosts: Sequence[str],
         ui_dir: str = "",
     ) -> None:
         if not 0 <= port <= 65535:
@@ -151,6 +263,7 @@ class WebScreen(Screen):
             raise ValueError(f"ui_dir: no {PAGE} in {self.ui_dir}")
         self.host = host
         self.port = port
+        self.hosts = Hosts(allowed_hosts, own_names(host))
         self.address: tuple[str, int] | None = None  # where it listens, once open
         self.revision = ""  # fingerprint of the renderer's files, once open
         self.state: ScreenState | None = None  # None until the first show()
@@ -159,14 +272,15 @@ class WebScreen(Screen):
         self._events: asyncio.Queue[ScreenEvent] = asyncio.Queue()
         self._runner: web.AppRunner | None = None
         self._unknown: set[tuple[str, str]] = set()
+        self._refused: set[str] = set()  # the kinds of request refused so far
 
     async def open(self) -> None:
         self.revision = await asyncio.to_thread(_revision, self.ui_dir)
-        app = web.Application()
+        app = web.Application(middlewares=[self._check_host])
         app.router.add_get("/ws", self._connect)
         app.router.add_get("/", self._page)
         app.router.add_static("/", self.ui_dir)
-        app.on_response_prepare.append(_no_cache)
+        app.on_response_prepare.append(_set_headers)
         runner = web.AppRunner(app, access_log=None, shutdown_timeout=self.close_timeout)
         await runner.setup()
         try:
@@ -230,12 +344,36 @@ class WebScreen(Screen):
         target = None if self.gaze is None else {"x": self.gaze[0], "y": self.gaze[1]}
         return {"type": "look", "target": target}
 
+    @web.middleware
+    async def _check_host(
+        self, request: web.Request, handler: Callable[[web.Request], Awaitable[web.StreamResponse]]
+    ) -> web.StreamResponse:
+        """Every route, the page, its files and ``/ws``, answers only to the screen's own
+        host names (``Hosts``). The host a request is for is the one aiohttp's
+        ``request.host`` reads as RFC 9112 says (3.2.2, 3.3): the request target's, when
+        it is a whole URL, as a client sends to a proxy, or else ``Host``'s, or else, from
+        a client that names none, which no browser is, the address it reached. The page's
+        origin is checked against the same host (``_from_this_screen``)."""
+        if not self.hosts.allow(request.host):
+            self._refuse("host", "refused a request for a host name the screen does not answer to")
+            raise web.HTTPForbidden(text=REFUSED_HOST)
+        return await handler(request)
+
+    def _refuse(self, kind: str, message: str) -> None:
+        """Log a refusal: a warning for the first of its kind, then at debug level, so that
+        a page that keeps trying does not fill the log. It never names what was sent."""
+        if kind in self._refused:
+            log.debug("%s", message)
+        else:
+            self._refused.add(kind)
+            log.warning("%s; the next ones are logged at debug level", message)
+
     async def _page(self, request: web.Request) -> web.FileResponse:
         return web.FileResponse(self.ui_dir / PAGE)
 
     async def _connect(self, request: web.Request) -> web.WebSocketResponse:
         if not _from_this_screen(request):  # it would drive the robot: refused (RFC 6455, 4.2.2)
-            log.warning("refused a page from another site")
+            self._refuse("origin", "refused a page from another site")
             raise web.HTTPForbidden()
         page = web.WebSocketResponse(heartbeat=self.heartbeat, timeout=self.close_timeout)
         await page.prepare(request)

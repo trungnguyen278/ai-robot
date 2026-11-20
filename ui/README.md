@@ -31,7 +31,7 @@ With the robot software running (`ai-robot --profile desktop`, see [software/](.
 
 ```text
 software ──state, look, voice──▶ link.js ──▶ animator.js ──▶ draw.js ──▶ canvas
-         ◀──ready, touch, hold──    │                │
+         ◀─ready, touch, hold, wake │                │
          ◀──action, close──────┐    │   expressions.js · motions.js · effects.js · pose.js · scenes/
                                │    ▼
                                └─ panel.js: panels in HTML, over the canvas
@@ -49,7 +49,7 @@ software ──state, look, voice──▶ link.js ──▶ animator.js ──�
 | `src/draw.js` | Draws a frame: scenes, face, glow, effects, status row |
 | `src/layout.js` | Fits the face to any screen size and shape; the studio's screen profiles |
 | `src/player.js` | Runs an animator on a canvas, at the display's refresh rate |
-| `src/link.js` | The screen protocol: applies the software's messages, reports the page, its taps and holds, and what the owner does on a panel |
+| `src/link.js` | The screen protocol: applies the software's messages, reports the page, its taps and holds, what the owner does on a panel, and a touch that lit the dark screen while the robot slept (`wake`, [ADR-0021](../docs/decisions/0021-sleep-and-wake.md)) |
 | `src/sleep.js` | The robot's sleep on the page: a Screen Wake Lock while the robot is awake; asleep, a sleepy face, closed eyes, and then the lock let go so that the screen turns off; the lock let go too once the link has been down for `grace` ([ADR-0021](../docs/decisions/0021-sleep-and-wake.md)) |
 | `src/panel.js` | Draws a panel the software describes, such as the settings, in HTML over the face: switches, sliders, choices, buttons and lines to read, with a question before what asks for one |
 | `src/press.js` | Tells a press held still, a hold, from a tap |
