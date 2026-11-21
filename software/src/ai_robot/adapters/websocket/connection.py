@@ -23,12 +23,16 @@ from ai_robot.core.data import Schema, encode, read_json, write_json
 log = logging.getLogger(__name__)
 
 # Fixed by the protocol (platform/protocols/cloud/README.md, Messages and schema.json).
-PROTOCOL = "3.2"  # the version of the link that the robot speaks
+PROTOCOL = "3.3"  # the version of the link that the robot speaks
 LEAVE_SINCE = (3, 2)  # the first version whose cloud takes a leave (leave)
 UNNUMBERED = frozenset({"hello", "ping", "pong", "reconnect", "bye"})
 LARGEST_SEQ = 2**53 - 1  # $defs/seq: what JSON numbers hold exactly
 MAX_BYE = 256  # characters in a bye's message ($defs/short_text)
 UNANSWERABLE = "invalid_message"  # why a session ends over a frame that cannot be answered
+# What the robot's bye no_hello adds, for the cloud's logs: which of its two causes it had
+# (The session, hello; the cloud says the same, examples/first-message.json).
+NOT_FIRST = "the first message was not a hello"
+NOT_IN_TIME = "the hello did not come in time"
 _VERSION = re.compile(r"([0-9]{1,3})\.([0-9]{1,3})")  # $defs/version
 
 
@@ -111,7 +115,7 @@ class Connection:
                 log.warning("a %s message came before the cloud's hello", message.type)
             else:
                 log.warning("a message came before the cloud's hello: %s", problem)
-            return Ending(greeted=False, reason="no_hello")
+            return Ending(greeted=False, reason="no_hello", message=NOT_FIRST)
         return message.body
 
     def write(self, text: str) -> None:

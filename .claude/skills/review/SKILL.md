@@ -44,12 +44,15 @@ A failing check is a finding; fix it before reading further.
 - Work on another side's text must take time in proportion to its length:
   - A regular expression that needs a closing delimiter is tried again from each escape before it. The string pattern in `read_json` once needed 2 h for 1 MiB, so its closing quote is optional.
   - jsonschema's `uniqueItems` compares each item with every other. `Schema` checks it only within the array's `maxItems` and `items`, and every such array in the protocols has both.
+  - A check that collects every error before it picks one builds an error for each item of a 1 MiB array: jsonschema's `best_match` over `iter_errors` took 4 s for 75,000. `Schema.problem` takes the first error, as Ajv does by default and `is_valid` does.
   - Time a test at the protocol's largest message, 1 MiB.
+  - A bug class met in reading or validating gets a vector in ai-platform's `vectors/`, in the pull request that finds it, so that every side runs it (`tests/test_vectors.py` here).
 - Numbers from another side:
   - An integer past a double's range is refused as a float is. `int()` refuses more than 4,300 digits (`sys.int_info`), and a reader in JavaScript takes the integer as an infinity.
   - A `Retry-After` is digits only (RFC 9110, §10.2.3). `int()` also takes `-5`, `1_000` and other scripts' digits, and a date can overflow `datetime`.
 - Size limits, at their exact value:
   - aiohttp 3.14.5 refuses a message of `max_msg_size` bytes and more, so the limit is set one past the protocol's.
+  - A limit is tested as each peer may send: whole, and in fragments, which a library counts in its own way. websockets 17.3 refused some messages of exactly 1 MiB in fragments under compression (ai-cloud's dev log, 2026-11-21).
   - A body read from another side is bounded before it is read, the token endpoint's answer included.
 - Text from another side reaches a log only once a schema has passed it, or quoted with `%r`: a line break in it would start a forged log line. What the robot remembers per kind or per sender (`MAX_WARNED`) is bounded.
 - An error replies to the message it answers whenever that message's `seq` can be read, in a handshake too; only an unreadable message's error has no `reply_to`.
