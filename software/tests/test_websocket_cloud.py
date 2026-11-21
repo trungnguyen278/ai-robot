@@ -153,7 +153,7 @@ def test_the_robot_connects_with_a_token_and_says_what_it_is() -> None:
             (token,) = cloud.tokens
             assert cloud.bearers == [f"Bearer {token}"]
             assert cloud.assertions[0]["aud"] == cloud.endpoint
-            assert said["protocol"] == "3.2"
+            assert said["protocol"] == "3.3"
             assert said["device"]["kind"] == "robot" and said["device"]["model"] == "concept-v0"
             assert said["languages"] == ["vi", "en"] and said["time_zone"] == "Asia/Ho_Chi_Minh"
             assert said["allowed_classes"] == ["informational"]
@@ -665,7 +665,11 @@ def test_a_cloud_that_does_not_answer_the_hello_gets_a_bye() -> None:
             await link.offer([], [])
             side = await cloud.connection()
             await side.next("hello")
-            assert await side.next("bye") == {"type": "bye", "reason": "no_hello"}
+            assert await side.next("bye") == {
+                "type": "bye",
+                "reason": "no_hello",
+                "message": "the hello did not come in time",
+            }
 
     run(main)
 
@@ -776,12 +780,17 @@ def test_a_first_message_that_is_no_hello_gets_a_bye(
     first: dict[str, Any], logged: str, caplog: pytest.LogCaptureFixture
 ) -> None:
     async def main() -> None:
-        async with robot_and_cloud() as (link, cloud):
+        # The bye comes at once, long before hello_timeout (3.3, examples/first-message.json).
+        async with robot_and_cloud(hello_timeout=10 * TIMEOUT) as (link, cloud):
             side, _ = await connect(link, cloud)
             side, said = await reconnection(cloud, side)
             assert said["resume"]["session"] == SESSION
             await side.ws.send_str(json.dumps(first))
-            assert await side.next("bye") == {"type": "bye", "reason": "no_hello"}
+            assert await side.next("bye") == {
+                "type": "bye",
+                "reason": "no_hello",
+                "message": "the first message was not a hello",
+            }
             side = await cloud.connection()
             assert "resume" not in await side.next("hello")  # the bye ended the session
 
@@ -829,24 +838,55 @@ def notification(seq: int, size: int) -> str:
     return text("x" * (size - len(text(""))))
 
 
-def test_a_message_as_large_as_the_protocol_allows_is_taken() -> None:
+async def send_text(side: CloudSide, text: str, frames: int) -> None:
+    """Send ``text`` as one message, in ``frames`` frames: a text frame, then continuation
+    frames, the last with FIN set, unmasked from a server (RFC 6455, 5.2 and 5.4). aiohttp
+    sends each message in one frame, so the fragments are written to the transport."""
+    if frames == 1:
+        await side.ws.send_str(text)
+        return
+    data = text.encode()
+    size = -(-len(data) // frames)
+    written = b""
+    for start in range(0, len(data), size):
+        chunk = data[start : start + size]
+        first = (0x80 if start + size >= len(data) else 0) | (0x1 if start == 0 else 0x0)
+        if len(chunk) < 126:
+            header = bytes([first, len(chunk)])
+        elif len(chunk) < 1 << 16:
+            header = bytes([first, 126]) + len(chunk).to_bytes(2, "big")
+        else:
+            header = bytes([first, 127]) + len(chunk).to_bytes(8, "big")
+        written += header + chunk
+    writer = side.ws._writer
+    assert writer is not None
+    writer.transport.write(written)
+
+
+# A message whole, and in fragments, which aiohttp counts together against its limit.
+FRAMES = pytest.mark.parametrize("frames", [1, 3], ids=["one frame", "fragments"])
+
+
+@FRAMES
+def test_a_message_as_large_as_the_protocol_allows_is_taken(frames: int) -> None:
     async def main() -> None:
         async with robot_and_cloud() as (link, cloud):
             side, _ = await connect(link, cloud)
             side.sent += 1
-            await side.ws.send_str(notification(side.sent, MAX_MESSAGE))
+            await send_text(side, notification(side.sent, MAX_MESSAGE), frames)
             asked = await side.mcp("server/discover")
             assert (await side.next("mcp"))["reply_to"] == asked["seq"]
 
     run(main)
 
 
-def test_a_message_too_large_ends_the_session() -> None:
+@FRAMES
+def test_a_message_too_large_ends_the_session(frames: int) -> None:
     async def main() -> None:
         async with robot_and_cloud() as (link, cloud):
             side, _ = await connect(link, cloud)
             side.sent += 1
-            await side.ws.send_str(notification(side.sent, MAX_MESSAGE + 1))
+            await send_text(side, notification(side.sent, MAX_MESSAGE + 1), frames)
             await asyncio.wait_for(side.closed.wait(), TIMEOUT)
             assert side.close_code == 1009  # "message too big": no bye can follow
             side = await cloud.connection()

@@ -231,9 +231,16 @@ class Schema:
 
     def problem(self, instance: Any) -> str | None:
         """What is wrong with ``instance``, or ``None`` if it matches: where, and the rule
-        it breaks, never the value, which may be a password or a token."""
-        error = best_match(self._validator.iter_errors(instance))
-        return None if error is None else _describe(error)
+        it breaks, never the value, which may be a password or a token. It is the first
+        rule broken, in the schema's order, where jsonschema's ``is_valid`` stops too:
+        ``best_match`` over every error built one for each item of a 1 MiB array, 75,000
+        of them in 2.5 to 5 s (ai-platform's dev log, 2026-11-20; the Pi, 2026-11-21). Ajv
+        also returns after the first error unless ``allErrors`` is set, which its security
+        page says not to do in production (ajv.js.org, Options and Security, read
+        2026-11-21); ai-cloud does the same."""
+        error = next(self._validator.iter_errors(instance), None)
+        # best_match descends into an anyOf's or a oneOf's own errors, which it holds already.
+        return None if error is None else _describe(best_match([error]))
 
 
 def _describe(error: ValidationError) -> str:

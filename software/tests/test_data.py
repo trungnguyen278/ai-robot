@@ -298,6 +298,21 @@ def test_unique_items_wait_for_the_array_s_other_rules(array: list[Any], rule: s
     assert time.perf_counter() - started < QUICK
 
 
+def test_a_problem_is_the_first_rule_broken_found_at_once() -> None:
+    """One error, the first in the schema's order. Weighing every error of a 1 MiB array
+    took 4 s on a desktop PC and 2.7 s on the Pi (2026-11-21): under the vectors' 5 s, which
+    do not catch it."""
+    strings = Schema("test", {"type": "array", "items": {"type": "string"}, "maxItems": 3})
+    objects = [{"a": item} for item in range(75_000)]
+    started = time.perf_counter()
+    assert strings.problem(objects) == "0: must be of type string"
+    assert time.perf_counter() - started < QUICK / 4
+    assert strings.problem(["a", 1, 2, 3]) == "1: must be of type string"
+    # best_match still says which branch of a oneOf failed, where one alone is weighed.
+    either = Schema("test", {"oneOf": [{"type": "string"}, {"type": "object", "required": ["a"]}]})
+    assert either.problem({}) == "'a' is a required property"
+
+
 def _unique_arrays(schema: Any) -> Iterator[dict[str, Any]]:
     if isinstance(schema, dict):
         if "uniqueItems" in schema:

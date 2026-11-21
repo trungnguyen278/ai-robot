@@ -30,6 +30,7 @@ import aiohttp
 from ai_robot import software_version
 from ai_robot.adapters.websocket.connection import (
     LEAVE_SINCE,
+    NOT_IN_TIME,
     PROTOCOL,
     Connection,
     Ending,
@@ -449,7 +450,7 @@ class WebSocketCloud(Cloud):
                 answer = await connection.first()
         except TimeoutError:
             log.warning("the cloud did not answer the hello within %g s", self.hello_timeout)
-            answer = Ending(greeted=False, reason="no_hello")
+            answer = Ending(greeted=False, reason="no_hello", message=NOT_IN_TIME)
         if isinstance(answer, Ending):
             return await connection.end(answer)
         if answer["resumed"] and (resuming is None or answer["session"] != resuming.id):
