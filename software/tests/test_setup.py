@@ -465,7 +465,7 @@ def test_an_app_that_connects_once_set_up_has_closed_gets_no_message() -> None:
     asyncio.run(main())
 
 
-def test_an_app_that_leaves_and_comes_back_is_served() -> None:
+def test_an_app_that_leaves_and_comes_back_is_served(caplog: pytest.LogCaptureFixture) -> None:
     async def main() -> None:
         robot = Robot()
         app = App(robot)
@@ -483,7 +483,9 @@ def test_an_app_that_leaves_and_comes_back_is_served() -> None:
                 await asyncio.sleep(0.01)
             assert not robot.module._inboxes  # nothing is kept of an app that left
 
-    asyncio.run(main())
+    with caplog.at_level(logging.INFO):
+        asyncio.run(main())
+    assert caplog.text.count("a set-up session ended: the app left") == 1  # once it had one
 
 
 def test_an_app_connects_once_until_it_leaves() -> None:

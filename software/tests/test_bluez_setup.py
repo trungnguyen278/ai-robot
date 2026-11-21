@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import errno
+import logging
 import os
 import re
 from collections.abc import AsyncIterator, Iterator
@@ -29,6 +30,7 @@ OTHER = "/org/bluez/hci0/dev_11_22_33_44_55_66"
 HELLO = b'{"type": "hello", "seq": 1, "protocol": "2.0"}'
 PROPERTIES = "org.freedesktop.DBus.Properties"
 ANSWER = ["org.bluez.GattCharacteristic1", "NotifyAcquired"]
+ALREADY_EXISTS = "org.bluez.Error.AlreadyExists"
 
 
 @pytest.fixture
@@ -450,7 +452,13 @@ def test_bluez_that_restarts_ends_its_apps_and_takes_the_service_again(bus: str)
     asyncio.run(main(), debug=True)
 
 
-def test_what_the_robot_asks_while_bluez_is_away_holds_once_it_is_back(bus: str) -> None:
+def test_what_the_robot_asks_while_bluez_is_away_holds_once_it_is_back(
+    bus: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    from fake_bluez import GATT_MANAGER
+
+    caplog.set_level(logging.INFO, logger="ai_robot.adapters.bluez.setup")
+
     async def main() -> None:
         async with started(bus) as (bluez, link):
             await bluez.stop()
@@ -469,14 +477,20 @@ def test_what_the_robot_asks_while_bluez_is_away_holds_once_it_is_back(bus: str)
             await bluez.start()
             await link.advertise(True)  # not offered: nothing
             assert bluez.registrations == ["application", "advertisement"]
+            await until(lambda: GATT_MANAGER in link._managers)
+            await link.start("Robot")  # set-up opened anew: not registered "again"
+            assert bluez.registrations[2:] == ["application", "advertisement"]
 
     asyncio.run(main())
+    assert caplog.text.count("registered with BlueZ again") == 1
 
 
 def test_a_controller_that_goes_away_and_comes_back(
     bus: str, caplog: pytest.LogCaptureFixture
 ) -> None:
     from fake_bluez import ADVERTISING_MANAGER, GATT_MANAGER, MANAGERS
+
+    caplog.set_level(logging.INFO, logger="ai_robot.adapters.bluez.setup")
 
     async def main() -> None:
         async with started(bus) as (bluez, link):
@@ -498,13 +512,110 @@ def test_a_controller_that_goes_away_and_comes_back(
             bluez.add(ADVERTISING_MANAGER)  # at once: two restorations meet
             await until(lambda: len(bluez.registrations) == 5)
             assert bluez.registrations[3:] == ["application", "advertisement"]
+            bluez.remove(*MANAGERS)
+            bluez.powered = False  # it comes back off
+            bluez.add(*MANAGERS)
+            await until(lambda: len(bluez.registrations) == 6)
+            bluez.power(True)
+            await until(lambda: len(bluez.registrations) == 7)
+            assert bluez.registrations[5:] == ["application", "advertisement"]
         assert "cannot register" not in caplog.text
+        assert caplog.text.count("registered with BlueZ again") == 3  # once each time
 
     asyncio.run(main())
 
 
+def test_bluetooth_switched_off_mid_session(bus: str, caplog: pytest.LogCaptureFixture) -> None:
+    """As ``bluetoothctl power off`` did as an app was served, on the Pi (2026-11-21): the
+    app leaves; the advertisement waits for the controller, and comes once it is on."""
+
+    async def main() -> None:
+        async with started(bus) as (bluez, link):
+            await connect(bluez, link, PHONE)
+            await link.advertise(False)  # as set-up does while it serves an app
+            bluez.registrations.clear()
+            bluez.power(False)
+            assert await next_event(link) == Disconnected(PHONE)
+            bluez.power(False)  # said again: nothing new
+            await link.advertise(True)  # it waits for the controller: no error
+            assert bluez.registrations == []
+            bluez.power(True)
+            await until(lambda: bluez.advertisement is not None)
+            assert bluez.registrations == ["advertisement"]
+            bluez.power(False)  # what BlueZ holds stays as the controller goes off and on
+            bluez.power(True)
+            await connect(bluez, link, PHONE)
+            assert bluez.registrations == ["advertisement"]
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(main())
+    assert caplog.text.count("Bluetooth is off") == 2
+
+
+def test_a_registration_bluez_refuses_as_it_returns_is_named(
+    bus: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The advertisement, refused as the controller comes on, while the service stays;
+    then the service, refused as BlueZ comes back."""
+
+    async def main() -> None:
+        async with started(bus) as (bluez, link):
+            await link.advertise(False)
+            bluez.power(False)
+            await until(lambda: not link._powered)  # the link heard it
+            await link.advertise(True)  # it waits for the controller
+            bluez.refuse_advertisement = True
+            bluez.power(True)
+            await until(lambda: "cannot register" in caplog.text)
+            assert "set-up cannot register its advertisement with BlueZ again" in caplog.text
+            assert "its service" not in caplog.text
+            caplog.clear()
+            await bluez.stop()
+            bluez.refuse = True
+            await bluez.start()
+            await until(lambda: "cannot register" in caplog.text)
+            assert "set-up cannot register its service with BlueZ again" in caplog.text
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(main())
+
+
+def test_set_up_that_starts_while_bluetooth_is_off(
+    bus: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    from fake_bluez import FakeBluez
+
+    from ai_robot.adapters.bluez.setup import BluezSetupLink
+
+    async def main() -> None:
+        bluez = FakeBluez(bus)
+        bluez.powered = False
+        await bluez.start()
+        link = BluezSetupLink(adapter="hci0", bus=bus, confirm_timeout=TIMEOUT)
+        await link.open()
+        try:
+            await link.start("Robot")  # no error: the service waits for the controller
+            assert bluez.application and bluez.advertisement is None
+            bluez.power(True)
+            await until(lambda: bluez.advertisement is not None)
+            await bluez.stop()  # BlueZ that starts with the controller off
+            bluez.powered = False
+            await bluez.start()
+            await until(lambda: bluez.application)
+            bluez.power(True)
+            await until(lambda: bluez.advertisement is not None)
+        finally:
+            await link.close()
+            await bluez.stop()
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(main())
+    assert "Bluetooth is off: set-up advertises once it is on" in caplog.text
+    assert "cannot register" not in caplog.text
+
+
 def test_another_controller_that_goes_changes_nothing(bus: str) -> None:
-    from dbus_fast import Message
+    from dbus_fast import Message, MessageType, Variant
     from fake_bluez import MANAGERS, OBJECT_MANAGER
 
     async def main() -> None:
@@ -514,15 +625,28 @@ def test_another_controller_that_goes_changes_nothing(bus: str) -> None:
             bluez.bus.send(
                 Message.new_signal("/", OBJECT_MANAGER, "InterfacesRemoved", "oas", removed)
             )
+            bluez.bus.send(
+                Message(
+                    destination=link._bus.unique_name,  # to the link alone: past its rules
+                    path="/org/bluez/hci1",
+                    interface=PROPERTIES,
+                    member="PropertiesChanged",
+                    message_type=MessageType.SIGNAL,
+                    signature="sa{sv}as",
+                    body=["org.bluez.Adapter1", {"Powered": Variant("b", False)}, []],
+                )
+            )
             ping = Message(
                 destination=link._bus.unique_name,
                 path="/",
                 interface="org.freedesktop.DBus.Peer",
                 member="Ping",
             )
-            await bluez.bus.call(ping)  # the link has taken the signal, sent before
+            await bluez.bus.call(ping)  # the link has taken the signals, sent before
             await link.advertise(False)
             assert bluez.registrations == ["-advertisement"]
+            await link.advertise(True)  # its own controller is on
+            assert bluez.registrations == ["-advertisement", "advertisement"]
 
     asyncio.run(main())
 
@@ -548,7 +672,7 @@ def test_starting_needs_bluez_and_its_managers(bus: str) -> None:
             with pytest.raises(ConnectionError, match="no GATT service and advertising"):
                 await link.start("Robot")
             await bluez.start(offers=("org.bluez.Adapter1", GATT_MANAGER))
-            await asyncio.sleep(0.1)
+            await until(lambda: GATT_MANAGER in link._managers)  # the link heard BlueZ
             with pytest.raises(ConnectionError, match="no GATT service and advertising"):
                 await link.start("Robot")
             assert bluez.registrations == []
@@ -591,6 +715,39 @@ def test_a_listing_older_than_a_change_is_taken_again(bus: str) -> None:
         link = BluezSetupLink(adapter="hci0", bus=bus, confirm_timeout=TIMEOUT)
         await link.open()
         try:
+            await link.start("Robot")
+            assert bluez.advertisement is not None
+        finally:
+            await link.close()
+            await bluez.stop()
+
+    asyncio.run(main())
+
+
+def test_a_listing_older_than_the_power_is_taken_again(bus: str) -> None:
+    """The controller goes on as BlueZ lists: the listing, which says it is off, is old."""
+    from dbus_fast import Message, Variant
+    from fake_bluez import ADAPTER, FakeBluez
+
+    from ai_robot.adapters.bluez.setup import BluezSetupLink
+
+    async def main() -> None:
+        bluez = FakeBluez(bus)
+        bluez.powered = False
+        await bluez.start()
+        bluez.hold = True
+        link = BluezSetupLink(adapter="hci0", bus=bus, confirm_timeout=TIMEOUT)
+        opening = asyncio.create_task(link.open())
+        try:
+            await until(lambda: bluez.held)
+            off = {"Powered": Variant("b", False)}
+            listed = {name: off if name == "org.bluez.Adapter1" else {} for name in bluez.managers}
+            bluez.hold = False
+            bluez.power(True)  # said before the listing's answer
+            bluez.bus.send(
+                Message.new_method_return(bluez.held[0], "a{oa{sa{sv}}}", [{ADAPTER: listed}])
+            )
+            await opening
             await link.start("Robot")
             assert bluez.advertisement is not None
         finally:
@@ -661,6 +818,102 @@ def test_an_advertisement_bluez_loses_as_it_answers_is_made_again(bus: str) -> N
     asyncio.run(main())
 
 
+def test_only_the_manager_that_goes_takes_its_registration(bus: str) -> None:
+    """The advertising manager that goes as BlueZ registers the service takes nothing of
+    the service: BlueZ holds it, and is not asked again."""
+    from fake_bluez import ADVERTISING_MANAGER
+
+    async def main() -> None:
+        async with started(bus) as (bluez, link):
+            await link.stop()
+            bluez.registrations.clear()
+            bluez.vanish = (ADVERTISING_MANAGER,)  # as BlueZ registers the service
+            await link.start("Robot")
+            assert bluez.application and bluez.advertisement is None
+            bluez.add(ADVERTISING_MANAGER)
+            await until(lambda: bluez.advertisement is not None)
+            assert bluez.registrations == ["application", "advertisement"]
+            assert ALREADY_EXISTS not in bluez.refusals
+
+    asyncio.run(main())
+
+
+def test_what_bluez_holds_already_is_held(bus: str) -> None:
+    """BlueZ answers AlreadyExists to a registration it holds already from the same sender
+    (match_app in src/gatt-database.c, match_client in src/advertising.c, BlueZ 5.85): as
+    after an unregistration that failed, which BlueZ may have made or not."""
+
+    async def main() -> None:
+        async with started(bus) as (bluez, link):
+            bluez.refuse_all = True
+            with pytest.raises(ConnectionError, match="UnregisterAdvertisement"):
+                await link.advertise(False)
+            bluez.refuse_all = False
+            bluez.registrations.clear()
+            await link.advertise(True)
+            assert bluez.refusals[-1] == ALREADY_EXISTS
+            await link.advertise(False)  # the link holds it
+            assert bluez.registrations == ["-advertisement"]
+            bluez.refuse_all = True
+            with pytest.raises(ConnectionError, match="UnregisterApplication"):
+                await link.stop()
+            bluez.refuse_all = False
+            bluez.registrations.clear()
+            await link.start("Robot")
+            assert bluez.refusals[-1] == ALREADY_EXISTS
+            assert bluez.registrations == ["advertisement"]
+            await link.stop()
+            assert bluez.application == {}  # the link held the service
+
+    asyncio.run(main())
+
+
+def test_a_stop_that_bluez_fails_holds_once_bluez_is_back(bus: str) -> None:
+    """BlueZ that fails the unregistration, as one that exits as it answers: set-up stays
+    closed, and BlueZ that comes back gets nothing."""
+    from fake_bluez import GATT_MANAGER
+
+    async def main() -> None:
+        async with started(bus) as (bluez, link):
+            await connect(bluez, link, PHONE)
+            bluez.refuse_all = True
+            with pytest.raises(ConnectionError, match="UnregisterAdvertisement"):
+                await link.stop()
+            assert await next_event(link) == Disconnected(PHONE)  # the app goes all the same
+            bluez.refuse_all = False
+            await bluez.stop()
+            await until(lambda: link._bluez.unique is None)
+            bluez.registrations.clear()
+            await bluez.start()
+            await until(lambda: GATT_MANAGER in link._managers)
+            await link.advertise(True)  # not offered: nothing
+            assert bluez.registrations == []
+
+    asyncio.run(main())
+
+
+def test_bluez_that_fails_while_set_up_is_closed_warns_of_nothing(
+    bus: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    from dbus_fast import Message
+
+    async def main() -> None:
+        async with started(bus) as (bluez, link):
+            await link.stop()
+            await bluez.stop()
+            await until(lambda: link._bluez.unique is None)
+            bluez.hold = True
+            await bluez.start()
+            await until(lambda: bluez.held)
+            no_reply = "org.freedesktop.DBus.Error.NoReply"
+            bluez.bus.send(Message.new_error(bluez.held[0], no_reply, "BlueZ stopped"))
+            await until(lambda: not link._tasks)  # the link has taken the error
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(main())
+    assert "cannot register" not in caplog.text
+
+
 def test_another_interface_that_goes_takes_no_registration(bus: str) -> None:
     async def main() -> None:
         async with started(bus) as (bluez, link):
@@ -723,6 +976,13 @@ def test_only_bluez_and_the_bus_are_heard(bus: str) -> None:
                     ["/org/bluez/hci0", list(MANAGERS)],
                 ),
                 Message.new_signal(
+                    "/org/bluez/hci0",
+                    PROPERTIES,
+                    "PropertiesChanged",
+                    "sa{sv}as",
+                    ["org.bluez.Adapter1", {"Powered": Variant("b", False)}, []],
+                ),
+                Message.new_signal(
                     "/org/freedesktop/DBus",
                     "org.freedesktop.DBus",
                     "NameOwnerChanged",
@@ -740,6 +1000,8 @@ def test_only_bluez_and_the_bus_are_heard(bus: str) -> None:
             assert await bluez.receive(PHONE, TIMEOUT) == b"info"
             await link.advertise(False)
             assert bluez.registrations == ["-advertisement"]  # it was still registered
+            await link.advertise(True)  # the controller is still on
+            assert bluez.registrations == ["-advertisement", "advertisement"]
 
     asyncio.run(main())
 

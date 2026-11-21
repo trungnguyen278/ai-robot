@@ -14,6 +14,12 @@ BlueZ offers its managers on the controller's object, and says when they come an
 advertising manager comes once the controller has told its features
 (``read_adv_features_callback``, src/advertising.c). BlueZ forgets every registration when
 it stops, or when the controller goes away (``adapter_remove``, src/adapter.c).
+
+The controller may be switched off, as ``bluetoothctl power off`` does: BlueZ says so on the
+adapter (``Powered``), then that each phone disconnected (``adapter_stop``). Registrations
+stay, but the kernel refuses a new advertisement until the controller is on again
+(``add_ext_adv_params``, net/bluetooth/mgmt.c, Linux 7.0), and BlueZ answers
+``org.bluez.Error.Failed``: as seen on the Pi, 2026-11-21.
 """
 
 from __future__ import annotations
@@ -32,9 +38,10 @@ from ai_robot.adapters.bluez.fragments import Joiner, split
 
 BLUEZ = "org.bluez"
 ADAPTER = "/org/bluez/hci0"
+ADAPTER_INTERFACE = "org.bluez.Adapter1"
 GATT_MANAGER = "org.bluez.GattManager1"
 ADVERTISING_MANAGER = "org.bluez.LEAdvertisingManager1"
-MANAGERS = ("org.bluez.Adapter1", GATT_MANAGER, ADVERTISING_MANAGER)
+MANAGERS = (ADAPTER_INTERFACE, GATT_MANAGER, ADVERTISING_MANAGER)
 OBJECT_MANAGER = "org.freedesktop.DBus.ObjectManager"
 DEVICE = "org.bluez.Device1"
 CHARACTERISTIC = "org.bluez.GattCharacteristic1"
@@ -67,7 +74,8 @@ class FakeBluez:
     interfaces that come as BlueZ lists its objects, after the listing; ``hold`` keeps
     listings unanswered; ``vanish`` names interfaces that go away as BlueZ answers the
     next registration, which BlueZ then loses if it needed them. ``registrations`` tells
-    each registration and unregistration, in order.
+    each registration and unregistration, in order, and ``refusals`` the name of each error
+    BlueZ answered. ``powered`` tells whether the controller is on (``power``).
     """
 
     def __init__(self, address: str) -> None:
@@ -85,6 +93,8 @@ class FakeBluez:
         self.held: list[Message] = []  # listings not answered
         self.vanish: tuple[str, ...] = ()
         self.registrations: list[str] = []
+        self.refusals: list[str] = []
+        self.powered = True
         self.refuse_all = False  # every call to the controller fails
         self.silent: set[str] = set()
         # Each phone's indications, and the channels the robot closed, in order.
@@ -128,9 +138,34 @@ class FakeBluez:
                 OBJECT_MANAGER,
                 "InterfacesAdded",
                 "oa{sa{sv}}",
-                [ADAPTER, {interface: {} for interface in interfaces}],
+                [ADAPTER, self._interfaces(interfaces)],
             )
         )
+
+    def power(self, on: bool) -> None:
+        """The controller goes on or off: BlueZ says so, and once it is off, that each phone
+        disconnected."""
+        assert self.bus is not None
+        self.powered = on
+        self.bus.send(
+            Message.new_signal(
+                ADAPTER,
+                PROPERTIES,
+                "PropertiesChanged",
+                "sa{sv}as",
+                [ADAPTER_INTERFACE, {"Powered": Variant("b", on)}, []],
+            )
+        )
+        if not on:
+            for device in list(self._channels):
+                self.disconnect(device)
+
+    def _interfaces(self, names: Any) -> dict[str, dict[str, Variant]]:
+        """The controller's ``names``, with their properties, as BlueZ lists them."""
+        return {
+            name: {"Powered": Variant("b", self.powered)} if name == ADAPTER_INTERFACE else {}
+            for name in names
+        }
 
     def remove(self, *interfaces: str) -> None:
         """The controller's object no longer offers ``interfaces``: all of them when the
@@ -173,7 +208,7 @@ class FakeBluez:
             if self.hold:
                 self.held.append(message)
                 return True
-            objects = {ADAPTER: {name: {} for name in self.managers}} if self.managers else {}
+            objects = {ADAPTER: self._interfaces(self.managers)} if self.managers else {}
             if self.late:
                 self.add(*self.late)
                 self.late = set()
@@ -242,6 +277,9 @@ class FakeBluez:
         if self.refuse_advertisement:
             self.refuse_advertisement = False
             self._error(message, "org.bluez.Error.Failed", "refused for the test")
+            return
+        if not self.powered:
+            self._error(message, "org.bluez.Error.Failed", "Failed to register advertisement")
             return
         if self._vanished(ADVERTISING_MANAGER):
             self._reply(message)
@@ -366,6 +404,7 @@ class FakeBluez:
 
     def _error(self, message: Message, name: str, text: str) -> None:
         assert self.bus is not None
+        self.refusals.append(name)
         self.bus.send(Message.new_error(message, name, text))
 
     async def call(

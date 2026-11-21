@@ -523,7 +523,8 @@ class SetupModule(Module):
         whether the app finished. Only whole messages keep it from being idle."""
         data: bytes | None = first
         while True:
-            if data is None:  # the app left
+            if data is None:  # the app left, or Bluetooth went
+                self.log.info("a set-up session ended: the app left")
                 return False
             try:
                 reply, request = session.receive(data)
