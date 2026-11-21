@@ -17,6 +17,7 @@ from local_dbus import impersonate, private_bus
 from ai_robot.ports.network import JoinError, JoinFailure, NetworkState, Security
 
 PSK, SAE, OWE, EAP = 0x100, 0x400, 0x800, 0x200
+TIMEOUT = 5.0
 
 
 @pytest.fixture
@@ -226,10 +227,186 @@ def test_only_networkmanager_tells_the_state_of_the_device(bus: str) -> None:
 
 
 def test_networkmanager_is_heard_after_it_restarts(bus: str) -> None:
+    """A NetworkManager that starts numbers its objects anew: the device may have another
+    path, which the robot asks the new one for."""
+    from fake_networkmanager import NM_PATH
+
     async def main() -> None:
         async with started(bus) as (manager, network):
             await manager.stop()
+            await waiting.until(lambda: network._owner.unique is None, timeout=TIMEOUT)
+            with pytest.raises(ConnectionError, match="does not run"):
+                await network.status()
+            manager.device = f"{NM_PATH}/Devices/4"
+            manager.destinations.clear()
             await manager.start()  # on a new connection, with a new unique name
+            assert manager.bus is not None
+            unique = manager.bus.unique_name
+            await waiting.until(lambda: network._owner.unique == unique, timeout=TIMEOUT)
+            status = await network.join(
+                b"Home", "correct horse", hidden=False, security=None, timeout=5.0
+            )
+            assert status.state is NetworkState.CONNECTED
+            assert set(manager.destinations) == {unique}  # never the name another may take
+
+    asyncio.run(main())
+
+
+def test_a_join_ends_at_once_when_networkmanager_stops(bus: str) -> None:
+    from fake_networkmanager import CONFIG
+
+    async def main() -> None:
+        async with started(bus) as (manager, network):
+            manager.stall = True
+            joining = asyncio.create_task(
+                network.join(b"Home", "correct horse", hidden=False, security=None, timeout=60)
+            )
+            await waiting.until(lambda: manager.state == CONFIG, timeout=TIMEOUT)
+            await manager.stop()
+            with pytest.raises(ConnectionError, match="NetworkManager stopped"):
+                await asyncio.wait_for(joining, TIMEOUT)
+
+    asyncio.run(main())
+
+
+def test_a_join_takes_no_change_left_from_an_earlier_one(bus: str) -> None:
+    """A join whose NetworkManager stopped as a call failed may leave that end unread, or
+    a state: the next join starts afresh."""
+    from fake_networkmanager import FAILED, NO_SECRETS
+
+    async def main() -> None:
+        async with started(bus) as (_, network):
+            network._changes.put_nowait(None)
+            network._changes.put_nowait((FAILED, NO_SECRETS))
+            status = await network.join(
+                b"Home", "correct horse", hidden=False, security=None, timeout=5.0
+            )
+            assert status.state is NetworkState.CONNECTED
+
+    asyncio.run(main())
+
+
+def test_a_path_from_one_networkmanager_never_reaches_the_next(bus: str) -> None:
+    """NetworkManager stops as the robot joins, and another takes its place, whose profile
+    of the same path is another network's: the join fails, and that profile stays."""
+    from fake_networkmanager import FakeNetworkManager
+
+    async def main() -> None:
+        async with started(bus) as (manager, network):
+            manager.save(b"Home", "an old password")
+            manager.leave_after = "GetSettings"  # once the robot has read the profile
+            following = FakeNetworkManager(bus, points())
+            office = following.save(b"Office", "office password")  # the same path
+            following.save(b"Home", "an old password")
+            await following.start()  # waits for the name
+            try:
+                with pytest.raises(ConnectionError):
+                    await network.join(
+                        b"Home", "correct horse", hidden=False, security=None, timeout=5.0
+                    )
+                assert following.profiles[office]["802-11-wireless"]["ssid"] == b"Office"
+                assert len(following.profiles) == 2
+                assert following.calls == []
+            finally:
+                await following.stop()
+
+    asyncio.run(main())
+
+
+@pytest.mark.parametrize(
+    ("knob", "member"),
+    [
+        ("leave_after", "ListConnections"),  # each profile is asked of one no longer there
+        ("leave_after", "GetSettings"),
+        ("exit_after", "ListConnections"),  # it keeps its name, and fails each call
+    ],
+)
+def test_the_factory_reset_fails_when_networkmanager_stops(
+    bus: str, knob: str, member: str
+) -> None:
+    """A reset that cannot read every profile fails, to be done again, and deletes no
+    profile of the NetworkManager that follows: had it taken the profiles it read for all
+    of them, the next NetworkManager would join a network set-up joined."""
+    from fake_networkmanager import FakeNetworkManager
+
+    from ai_robot.adapters.dbus import connect
+    from ai_robot.adapters.networkmanager.profiles import MADE, MARK, forget_made
+
+    async def main() -> None:
+        manager = FakeNetworkManager(bus, [])
+        home = manager.save(b"Home", "correct horse", user={MARK: MADE})
+        cafe = manager.save(b"Cafe", "cafe password", user={MARK: MADE})
+        setattr(manager, knob, member)
+        following = FakeNetworkManager(bus, [])
+        office = following.save(b"Office", "office password")  # the same path as Home's
+        await manager.start()
+        await following.start()
+        client = await connect(bus)
+        try:
+            with pytest.raises(ConnectionError):
+                await forget_made(client)
+            assert list(following.profiles) == [office]
+            assert list(manager.profiles) == [home, cafe]
+        finally:
+            client.disconnect()
+            await following.stop()
+            await manager.stop()
+
+    asyncio.run(main())
+
+
+def test_the_factory_reset_passes_over_a_profile_gone_or_private(bus: str) -> None:
+    from fake_networkmanager import SETTINGS_PATH, FakeNetworkManager
+
+    from ai_robot.adapters.dbus import connect
+    from ai_robot.adapters.networkmanager.profiles import MADE, MARK, forget_made
+
+    async def main() -> None:
+        manager = FakeNetworkManager(bus, [])
+        manager.ghosts.add(f"{SETTINGS_PATH}/90")  # deleted as NetworkManager listed it
+        private = manager.save(b"Hers", "her password")  # another user's own
+        manager.private.add(private)
+        manager.save(b"Home", "correct horse", user={MARK: MADE})
+        await manager.start()
+        client = await connect(bus)
+        try:
+            assert await forget_made(client) == 1
+            assert list(manager.profiles) == [private]
+        finally:
+            client.disconnect()
+            await manager.stop()
+
+    asyncio.run(main())
+
+
+@pytest.mark.parametrize("knob", ["leave_after", "exit_after"])
+@pytest.mark.parametrize("asked", ["scan", "join"])
+def test_a_networkmanager_that_stops_as_it_lists_access_points_fails_the_call(
+    bus: str, knob: str, asked: str
+) -> None:
+    """Neither an empty scan nor a network out of reach: NetworkManager failed."""
+
+    async def main() -> None:
+        async with started(bus) as (manager, network):
+            setattr(manager, knob, "GetAllAccessPoints")
+            with pytest.raises(ConnectionError):  # a JoinError is none
+                if asked == "scan":
+                    await network.scan()
+                else:
+                    await network.join(
+                        b"Home", "correct horse", hidden=False, security=None, timeout=5.0
+                    )
+
+    asyncio.run(main())
+
+
+def test_an_access_point_gone_as_networkmanager_lists_it_is_passed_over(bus: str) -> None:
+    from fake_networkmanager import NM_PATH
+
+    async def main() -> None:
+        async with started(bus) as (manager, network):
+            manager.ghosts.add(f"{NM_PATH}/AccessPoint/90")
+            assert [n.ssid for n in await network.scan()][:2] == [b"Home", b"Modern"]
             status = await network.join(
                 b"Home", "correct horse", hidden=False, security=None, timeout=5.0
             )

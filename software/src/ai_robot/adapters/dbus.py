@@ -14,6 +14,13 @@ BUS_NAME = "org.freedesktop.DBus"  # the bus itself (the D-Bus specification)
 BUS_PATH = "/org/freedesktop/DBus"
 OBJECT_MANAGER = "org.freedesktop.DBus.ObjectManager"
 
+# What a call to an object no longer there is answered: GDBus, which NetworkManager
+# speaks D-Bus through, answers UnknownMethod, "Object does not exist at path"
+# (distribute_method_call in gio/gdbusconnection.c, GLib 2.86.0); UnknownObject is the
+# reference library's name for the same ("Object you invoked a method on isn't known",
+# dbus/dbus-protocol.h, dbus 1.16.2). Both read 2026-11-21.
+NO_SUCH_OBJECT = frozenset({f"{BUS_NAME}.Error.UnknownMethod", f"{BUS_NAME}.Error.UnknownObject"})
+
 
 async def connect(address: str, *, unix_fds: bool = False) -> MessageBus:
     """A connection to the bus at ``address``: ``system``, or another bus's address, as
@@ -21,6 +28,21 @@ async def connect(address: str, *, unix_fds: bool = False) -> MessageBus:
     if address == "system":
         return await MessageBus(bus_type=BusType.SYSTEM, negotiate_unix_fd=unix_fds).connect()
     return await MessageBus(bus_address=address, negotiate_unix_fd=unix_fds).connect()
+
+
+class CallError(ConnectionError):
+    """A call that failed: ``name`` is the D-Bus error's name, such as
+    ``org.bluez.Error.AlreadyExists``, or None when no reply came."""
+
+    def __init__(self, text: str, name: str | None) -> None:
+        super().__init__(text)
+        self.name = name
+
+
+def gone(error: CallError) -> bool:
+    """Whether ``error`` says that the object called is no longer there, and nothing else:
+    a service that has left the bus, or that fails as it stops, is another failure."""
+    return error.name in NO_SUCH_OBJECT
 
 
 async def call(
@@ -33,7 +55,7 @@ async def call(
     body: Sequence[Any] = (),
 ) -> list[Any]:
     """Call ``interface.member`` on ``path`` of ``destination``; its reply's values.
-    ``ConnectionError`` for an error, or no reply."""
+    ``CallError``, a ``ConnectionError``, for an error, or no reply."""
     reply = await bus.call(
         Message(
             destination=destination,
@@ -46,9 +68,17 @@ async def call(
     )
     if reply is None or reply.message_type is MessageType.ERROR:
         detail = reply.body[0] if reply is not None and reply.body else "no reply"
-        name = reply.error_name if reply is not None else "?"
-        raise ConnectionError(f"{interface}.{member} failed: {name}: {detail}")
+        name = reply.error_name if reply is not None else None
+        raise CallError(f"{interface}.{member} failed: {name or '?'}: {detail}", name)
     return list(reply.body)
+
+
+async def owner_of(bus: MessageBus, name: str) -> str:
+    """The unique name of the connection that owns ``name`` now. A call sent to it reaches
+    that connection alone, or fails once it has left: never one that took the name since.
+    ``ConnectionError`` if no one owns it."""
+    (owner,) = await call(bus, BUS_NAME, BUS_PATH, BUS_NAME, "GetNameOwner", "s", [name])
+    return str(owner)
 
 
 async def watch(bus: MessageBus, rule: str) -> None:
@@ -83,9 +113,7 @@ class Owner:
         )
         heard = self._changes
         try:
-            (owner,) = await call(
-                bus, BUS_NAME, BUS_PATH, BUS_NAME, "GetNameOwner", "s", [self.name]
-            )
+            owner: str | None = await owner_of(bus, self.name)
         except ConnectionError:  # no one owns it
             owner = None
         if self._changes == heard:

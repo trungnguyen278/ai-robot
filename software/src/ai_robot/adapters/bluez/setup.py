@@ -14,6 +14,12 @@ does (its ``postinst``), or when the controller goes away. The link follows Blue
 on the bus and the managers on the controller's object, as BlueZ's own client does
 (gdbus/client.c) and PipeWire (spa/plugins/bluez5/bluez5-dbus.c, 1.4.9): what BlueZ loses
 ends its apps, and the link registers it again once BlueZ offers its managers again.
+
+The controller takes a new advertisement only while it is powered: Linux refuses its
+extended advertising commands otherwise (``add_ext_adv_params`` in net/bluetooth/mgmt.c,
+v7.0), which BlueZ uses when the kernel has them (src/advertising.c). One registered before
+the controller went off is kept, and sent again once it is on. So the link follows the
+controller's ``Powered``, and advertises once it is on.
 """
 
 # No `from __future__ import annotations` here: dbus-fast reads the annotations of the
@@ -35,7 +41,7 @@ from dbus_fast.constants import PropertyAccess
 from dbus_fast.service import ServiceInterface, dbus_method, dbus_property
 
 from ai_robot.adapters.bluez.fragments import FragmentError, Joiner, split
-from ai_robot.adapters.dbus import OBJECT_MANAGER, Owner, call, connect, watch
+from ai_robot.adapters.dbus import OBJECT_MANAGER, CallError, Owner, call, connect, watch
 from ai_robot.core.checks import positive
 from ai_robot.ports.setup import Connected, Disconnected, LinkEvent, Received, SetupLink
 
@@ -48,6 +54,7 @@ ANSWER_UUID = "eaf35dcd-e774-4881-b0c6-4990127a1289"
 
 # BlueZ's D-Bus interfaces (doc/org.bluez.*.rst in BlueZ's sources).
 BLUEZ = "org.bluez"
+ADAPTER = "org.bluez.Adapter1"
 GATT_MANAGER = "org.bluez.GattManager1"
 ADVERTISING_MANAGER = "org.bluez.LEAdvertisingManager1"
 CHARACTERISTIC = "org.bluez.GattCharacteristic1"
@@ -56,6 +63,9 @@ PROPERTIES = "org.freedesktop.DBus.Properties"
 # The error BlueZ takes as final when it asks for a channel: it then does not fall back on
 # StartNotify (acquire_notify_reply in src/gatt-database.c, BlueZ 5.85).
 FAILED = "org.bluez.Error.Failed"
+# BlueZ's answer to a registration it holds already, from the same connection at the same
+# path (match_app in src/gatt-database.c, match_client in src/advertising.c, BlueZ 5.85).
+ALREADY_EXISTS = "org.bluez.Error.AlreadyExists"
 DEFAULT_MTU = 23  # the ATT MTU until a larger one is exchanged (Bluetooth Core, Vol 3, Part F)
 # BlueZ writes one byte, 0x01, for each confirmation (sock_io_write in src/gatt-database.c).
 CONFIRMATION_BYTES = 1
@@ -249,15 +259,17 @@ class BluezSetupLink(SetupLink):
         self._advertisement = _Advertisement()
         self._bluez = Owner(BLUEZ)
         self._managers: set[str] = set()  # the interfaces BlueZ offers on the controller
+        self._powered = False  # whether the controller is on, as BlueZ last said
         self._heard = 0  # changes of BlueZ or of them, so that an older listing undoes none
         # What the robot offers: the service, from start to stop, and its advertisement.
         self._offered = False
         self._advertising = False
-        # What BlueZ holds of it, and how often BlueZ lost some, so that a registration
-        # that ends after BlueZ lost it is not taken as held.
+        # What BlueZ holds of it, and how often BlueZ lost what each manager held, so that
+        # a registration that ends after BlueZ lost its manager is not taken as held.
         self._registered = False
         self._advertised = False
-        self._losses = 0
+        self._losses = dict.fromkeys((GATT_MANAGER, ADVERTISING_MANAGER), 0)
+        self._restoring = False  # BlueZ lost the service while it was offered
         self._registering = asyncio.Lock()
         self._apps: dict[str, _App] = {}  # device path -> the app connected through it
         self._channels: dict[str, _Channel] = {}  # device path -> its channel for indications
@@ -309,8 +321,9 @@ class BluezSetupLink(SetupLink):
     # ---- the port ----
 
     async def start(self, name: str) -> None:
-        """Offer the service, then advertise it. ``ConnectionError`` if BlueZ does not run,
-        does not offer both on the controller, or refuses: then nothing is offered."""
+        """Offer the service, then advertise it, once the controller is on.
+        ``ConnectionError`` if BlueZ does not run, does not offer both on the controller,
+        or refuses: then nothing is offered."""
         self._advertisement.local = short_name(name)
         if self._offered:
             await self.advertise(True)
@@ -318,6 +331,7 @@ class BluezSetupLink(SetupLink):
         if not {GATT_MANAGER, ADVERTISING_MANAGER} <= self._managers:
             raise ConnectionError("BlueZ offers no GATT service and advertising on the controller")
         self._offered = self._advertising = True
+        self._restoring = False
         try:
             await self._sync()
         except BaseException:
@@ -325,21 +339,27 @@ class BluezSetupLink(SetupLink):
             with contextlib.suppress(ConnectionError):
                 await self._sync()
             raise
+        if not self._powered:
+            log.warning("Bluetooth is off: set-up advertises once it is on")
 
     async def advertise(self, on: bool) -> None:
-        """Advertise while the service is offered, or stop. While BlueZ is away, the link
-        keeps what it was asked, and advertises once BlueZ is back."""
+        """Advertise while the service is offered, or stop. While BlueZ is away or the
+        controller is off, the link keeps what it was asked, and advertises once BlueZ is
+        back and the controller on."""
         self._advertising = on
         await self._sync()
 
     async def stop(self) -> None:
-        await self.advertise(False)
-        for peer in list(self._apps):
-            await self.drop(peer)
-        for channel in list(self._channels.values()):  # apps that never wrote
-            channel.close()
-        self._offered = False
-        await self._sync()
+        """Stop advertising, unregister the service, and let every app go. What was asked
+        holds even if BlueZ fails meanwhile: BlueZ that comes back gets nothing."""
+        self._offered = self._advertising = False
+        try:
+            await self._sync()
+        finally:
+            for peer in list(self._apps):
+                await self.drop(peer)
+            for channel in list(self._channels.values()):  # apps that never wrote
+                channel.close()
 
     async def event(self) -> LinkEvent:
         return await self._events.get()
@@ -393,8 +413,8 @@ class BluezSetupLink(SetupLink):
 
     def _on_message(self, message: Message) -> bool | None:
         """BlueZ asks for a channel; BlueZ comes or goes; or it says what changed: the
-        managers it offers on the controller, or a device's connection. Only signals that
-        BlueZ sent count, as the bus says who sent each."""
+        managers it offers on the controller, whether the controller is on, or a device's
+        connection. Only signals that BlueZ sent count, as the bus says who sent each."""
         if message.message_type is MessageType.METHOD_CALL:
             if (message.path, message.interface, message.member) == (
                 ANSWER_PATH,
@@ -419,6 +439,15 @@ class BluezSetupLink(SetupLink):
             if connected is not None and not connected.value:
                 self._left(message.path)
         elif (
+            message.member == "PropertiesChanged"
+            and message.path == self.adapter_path
+            and message.body
+            and message.body[0] == ADAPTER
+            and "Powered" in message.body[1]
+        ):
+            self._heard += 1
+            self._power(message.body[1]["Powered"].value)
+        elif (
             message.interface == OBJECT_MANAGER
             and message.body
             and message.body[0] == self.adapter_path
@@ -426,53 +455,67 @@ class BluezSetupLink(SetupLink):
             self._heard += 1
             if message.member == "InterfacesAdded":
                 self._managers |= set(message.body[1])
+                if ADAPTER in message.body[1]:
+                    self._powered = _is_on(message.body[1])
                 self._spawn(self._restore(listed=True))
             elif message.member == "InterfacesRemoved":
                 self._lose(set(message.body[1]))
         return None
+
+    def _power(self, on: bool) -> None:
+        """The controller went on or off. Apps leave when it goes off, as BlueZ says of
+        each (``adapter_stop`` in src/adapter.c); once it is on, the link advertises."""
+        if on == self._powered:
+            return
+        self._powered = on
+        if on:
+            self._spawn(self._restore(listed=True))
+        elif self._offered:
+            log.warning("Bluetooth is off: set-up advertises once it is on")
 
     def _lose(self, managers: set[str]) -> None:
         """BlueZ no longer offers ``managers`` on the controller, and lost what the robot
         registered with them. Apps leave with the GATT manager: the controller is gone."""
         managers = set(managers)  # it may be the link's own set
         self._managers -= managers
-        if not managers & {GATT_MANAGER, ADVERTISING_MANAGER}:
-            return
-        self._losses += 1
+        for manager in managers & self._losses.keys():
+            self._losses[manager] += 1
         if ADVERTISING_MANAGER in managers:
             self._advertised = False
         if GATT_MANAGER in managers:
             self._registered = False
+            self._restoring = self._offered
             for peer in list(self._apps):
                 self._left(peer)
             for channel in list(self._channels.values()):
                 channel.close()
 
     async def _list(self) -> None:
-        """Learn which managers BlueZ offers on the controller."""
+        """Learn which managers BlueZ offers on the controller, and whether it is on."""
         while True:
             heard = self._heard
             (objects,) = await self._bluez_call("/", OBJECT_MANAGER, "GetManagedObjects")
             if self._heard == heard:  # else a change came meanwhile: list again
-                self._managers = set(objects.get(self.adapter_path, {}))
+                interfaces = objects.get(self.adapter_path, {})
+                self._managers = set(interfaces)
+                self._powered = _is_on(interfaces)
                 return
 
     async def _restore(self, *, listed: bool = False) -> None:
-        """Register again what BlueZ lost, once it offers its managers again."""
-        registered = self._registered
+        """Register again what BlueZ lost, once it offers its managers again, and advertise
+        once the controller is on."""
         try:
             if not listed:
                 await self._list()
             await self._sync()
         except ConnectionError as error:
-            log.warning("set-up cannot register its service with BlueZ again: %s", error)
-            return
-        if self._registered and not registered:
-            log.info("set-up's service is registered with BlueZ again")
+            if self._offered:
+                what = "its advertisement" if self._registered else "its service"
+                log.warning("set-up cannot register %s with BlueZ again: %s", what, error)
 
     async def _sync(self) -> None:
         """Have BlueZ hold what the robot offers, as far as BlueZ offers its managers:
-        the service, then its advertisement."""
+        the service, then its advertisement, while the controller is on."""
         async with self._registering:
             if self._advertised and not self._advertising:
                 self._advertised = False
@@ -488,26 +531,33 @@ class BluezSetupLink(SetupLink):
                 await self._bluez_call(
                     self.adapter_path, GATT_MANAGER, "UnregisterApplication", "o", [ROOT]
                 )
-            losses = self._losses
             if self._offered and not self._registered and GATT_MANAGER in self._managers:
-                await self._bluez_call(
-                    self.adapter_path, GATT_MANAGER, "RegisterApplication", "oa{sv}", [ROOT, {}]
-                )
-                self._registered = self._losses == losses
+                self._registered = await self._register(GATT_MANAGER, "RegisterApplication", ROOT)
+                if self._registered and self._restoring:
+                    self._restoring = False
+                    log.info("set-up's service is registered with BlueZ again")
             if (
                 self._advertising
                 and self._registered
                 and not self._advertised
                 and ADVERTISING_MANAGER in self._managers
+                and self._powered
             ):
-                await self._bluez_call(
-                    self.adapter_path,
-                    ADVERTISING_MANAGER,
-                    "RegisterAdvertisement",
-                    "oa{sv}",
-                    [ADVERTISEMENT_PATH, {}],
+                self._advertised = await self._register(
+                    ADVERTISING_MANAGER, "RegisterAdvertisement", ADVERTISEMENT_PATH
                 )
-                self._advertised = self._losses == losses
+
+    async def _register(self, manager: str, member: str, path: str) -> bool:
+        """Register ``path`` with ``manager``; whether BlueZ holds it, which it does not if
+        it lost ``manager`` as it answered. BlueZ that answers it holds ``path`` already
+        holds it."""
+        losses = self._losses[manager]
+        try:
+            await self._bluez_call(self.adapter_path, manager, member, "oa{sv}", [path, {}])
+        except CallError as error:
+            if error.name != ALREADY_EXISTS:
+                raise
+        return self._losses[manager] == losses
 
     def _spawn(self, work: Coroutine[Any, Any, None]) -> None:
         task = asyncio.get_running_loop().create_task(work)
@@ -596,3 +646,9 @@ class BluezSetupLink(SetupLink):
 def _mtu(options: dict[str, Variant]) -> int:
     """The ATT MTU BlueZ gives in ``options``."""
     return int(options["mtu"].value) if "mtu" in options else DEFAULT_MTU
+
+
+def _is_on(interfaces: dict[str, dict[str, Variant]]) -> bool:
+    """Whether the controller whose ``interfaces`` BlueZ lists is on."""
+    powered = interfaces.get(ADAPTER, {}).get("Powered")
+    return bool(powered.value) if powered is not None else False

@@ -20,6 +20,14 @@ SETTINGS_PATH = f"{NM_PATH}/Settings"
 IP4_PATH = f"{NM_PATH}/IP4Config/1"
 PROPERTIES = "org.freedesktop.DBus.Properties"
 ADDRESS = "192.168.1.23"
+# Its answers to a call that fails, as NetworkManager 1.54.0 gives them (read 2026-11-21):
+# GDBus's to an object not there (gio/gdbusconnection.c, GLib 2.86.0), its own to a call
+# while it stops (nm-dbus-manager.c) and to a profile another user keeps private
+# (nm-settings-connection.c), and the name of NM_MANAGER_ERROR_UNKNOWN_DEVICE (nm-errors.c).
+NO_SUCH_OBJECT = "org.freedesktop.DBus.Error.UnknownMethod"
+EXITING = "org.freedesktop.DBus.Error.Failed"
+PRIVATE = f"{NM}.Settings.PermissionDenied"
+UNKNOWN_DEVICE = f"{NM}.UnknownDevice"
 
 # Its enumerations (nm-dbus-types).
 PREPARE, CONFIG, NEED_AUTH, IP_CONFIG, ACTIVATED, FAILED, DISCONNECTED = (
@@ -46,21 +54,42 @@ class AccessPoint:
     dhcp: bool = True  # whether it gives an address
 
 
+class Refused(Exception):
+    """A call the fake answers with the D-Bus error ``name``."""
+
+    def __init__(self, name: str, text: str) -> None:
+        super().__init__(text)
+        self.name = name
+
+
 class FakeNetworkManager:
     """Owns ``org.freedesktop.NetworkManager`` on the bus at ``address``, with the device
-    ``wlan0`` seeing ``points``. ``profiles`` holds the connection profiles (path ->
-    settings, secrets included); ``stall`` makes joins hang; ``calls`` lists the methods
-    called."""
+    ``wlan0``, at ``device``, seeing ``points``; if another owns the name, it waits for it,
+    as the bus queues a request (the D-Bus specification, ``RequestName``). ``profiles``
+    holds the connection profiles (path -> settings, secrets included), and ``private``
+    those another user keeps to themselves; ``ghosts`` are the paths of profiles and
+    access points it lists but no longer has, as one gone as it answers. ``stall`` makes
+    joins hang; ``leave_after`` names a method after whose answer it leaves the bus, and
+    ``exit_after`` one after whose answer it fails every call, as it does while it stops;
+    ``calls`` lists the methods called, and ``destinations`` the names each call was sent
+    to."""
 
-    def __init__(self, address: str, points: list[AccessPoint]) -> None:
+    def __init__(self, address: str, points: list[AccessPoint], device: str = DEVICE_PATH) -> None:
         self.address = address
+        self.device = device
         self.points = {f"{NM_PATH}/AccessPoint/{n}": p for n, p in enumerate(points, 1)}
         self.profiles: dict[str, dict[str, dict[str, Any]]] = {}
         self.state = DISCONNECTED
         self.active_point = "/"
         self.last_scan = 1000
         self.stall = False
+        self.leave_after: str | None = None
+        self.exit_after: str | None = None
+        self.private: set[str] = set()
+        self.ghosts: set[str] = set()
+        self._exiting = False
         self.calls: list[str] = []
+        self.destinations: list[str] = []
         self.bus: MessageBus | None = None
         self._numbers = itertools.count(1)
         self._tasks: set[asyncio.Task[None]] = set()
@@ -75,6 +104,7 @@ class FakeNetworkManager:
             task.cancel()
         if self.bus is not None:
             self.bus.disconnect()
+            self.bus = None
 
     def save(self, ssid: bytes, password: str | None, user: dict[str, str] | None = None) -> str:
         """Keep a profile for ``ssid``, as one saved earlier, with ``user`` data if any."""
@@ -94,16 +124,27 @@ class FakeNetworkManager:
         if message.message_type is not MessageType.METHOD_CALL:
             return None
         self.calls.append(message.member)
+        self.destinations.append(message.destination)
         try:
+            if self._exiting:
+                raise Refused(EXITING, "NetworkManager is exiting")
             answer = self._answer(message)
-        except LookupError as error:
-            self._send(Message.new_error(message, f"{NM}.UnknownObject", str(error)))
+        except Refused as error:
+            self._send(Message.new_error(message, error.name, str(error)))
             return True
         if answer is None:
             return None
         signature, body = answer
-        self._send(Message.new_method_return(message, signature, body))
+        sent = self._send(Message.new_method_return(message, signature, body))
+        if message.member == self.leave_after:
+            self._spawn(self._leave(sent))
+        if message.member == self.exit_after:
+            self._exiting = True
         return True
+
+    async def _leave(self, sent: asyncio.Future[None]) -> None:
+        await sent
+        await self.stop()
 
     def _answer(self, message: Message) -> tuple[str, list[Any]] | None:
         member, body = message.member, message.body
@@ -116,21 +157,24 @@ class FakeNetworkManager:
             return None
         if member == "GetDeviceByIpIface":
             if body[0] != "wlan0":
-                raise LookupError(f"no device {body[0]}")
-            return "o", [DEVICE_PATH]
+                raise Refused(UNKNOWN_DEVICE, "No device found for the requested iface.")
+            return "o", [self.device]
         if member == "RequestScan":
             self.last_scan += 1
             return "", []
         if member == "GetAllAccessPoints":
-            return "ao", [list(self.points)]
+            return "ao", [[*self._ghosts(f"{NM_PATH}/AccessPoint/"), *self.points]]
         if member == "ListConnections":
-            return "ao", [list(self.profiles)]
+            return "ao", [[*self._ghosts(f"{SETTINGS_PATH}/"), *self.profiles]]
         if member == "GetSettings":
-            settings = self.profiles[message.path]
+            if message.path in self.private:
+                raise Refused(PRIVATE, "Insufficient privileges")
+            settings = self._profile(message.path)
             public = {name: dict(group) for name, group in settings.items()}
             public.get("802-11-wireless-security", {}).pop("psk", None)  # secrets stay
             return "a{sa{sv}}", [self._variants(public)]
         if member == "Delete":
+            self._profile(message.path)
             del self.profiles[message.path]
             return "", []
         if member == "AddAndActivateConnection2":
@@ -153,10 +197,10 @@ class FakeNetworkManager:
     def _properties(self, path: str, interface: str) -> dict[str, Variant]:
         if path == NM_PATH:
             return {"Connectivity": Variant("u", 4)}
-        if path == DEVICE_PATH and interface.endswith("Device"):
+        if path == self.device and interface.endswith("Device"):
             config = IP4_PATH if self.state == ACTIVATED else "/"
             return {"State": Variant("u", self.state), "Ip4Config": Variant("o", config)}
-        if path == DEVICE_PATH:
+        if path == self.device:
             return {
                 "LastScan": Variant("x", self.last_scan),
                 "ActiveAccessPoint": Variant("o", self.active_point),
@@ -166,7 +210,7 @@ class FakeNetworkManager:
             return {"AddressData": Variant("aa{sv}", [address])}
         point = self.points.get(path)
         if point is None:
-            raise LookupError(path)
+            raise _no_such_object(path)
         return {
             "Ssid": Variant("ay", b"" if point.hidden else point.ssid),
             "Strength": Variant("y", point.strength),
@@ -174,6 +218,15 @@ class FakeNetworkManager:
             "WpaFlags": Variant("u", point.wpa),
             "RsnFlags": Variant("u", point.rsn),
         }
+
+    def _profile(self, path: str) -> dict[str, dict[str, Any]]:
+        settings = self.profiles.get(path)
+        if settings is None:
+            raise _no_such_object(path)
+        return settings
+
+    def _ghosts(self, prefix: str) -> list[str]:
+        return sorted(path for path in self.ghosts if path.startswith(prefix))
 
     async def _activate(self, profile: str, point_path: str) -> None:
         """Join as NetworkManager does, telling each state of the device."""
@@ -207,7 +260,7 @@ class FakeNetworkManager:
         old, self.state = self.state, state
         self._send(
             Message.new_signal(
-                DEVICE_PATH, f"{NM}.Device", "StateChanged", "uuu", [state, old, reason]
+                self.device, f"{NM}.Device", "StateChanged", "uuu", [state, old, reason]
             )
         )
         await asyncio.sleep(0.01)
@@ -220,11 +273,15 @@ class FakeNetworkManager:
             for name, group in settings.items()
         }
 
-    def _send(self, message: Message) -> None:
+    def _send(self, message: Message) -> asyncio.Future[None]:
         assert self.bus is not None
-        self.bus.send(message)
+        return self.bus.send(message)
 
     def _spawn(self, coroutine: Any) -> None:
         task = asyncio.get_running_loop().create_task(coroutine)
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
+
+
+def _no_such_object(path: str) -> Refused:
+    return Refused(NO_SUCH_OBJECT, f'Object does not exist at path "{path}"')
