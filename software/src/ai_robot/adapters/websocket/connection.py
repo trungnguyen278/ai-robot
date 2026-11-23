@@ -23,7 +23,7 @@ from ai_robot.core.data import Schema, encode, read_json, write_json
 log = logging.getLogger(__name__)
 
 # Fixed by the protocol (platform/protocols/cloud/README.md, Messages and schema.json).
-PROTOCOL = "3.3"  # the version of the link that the robot speaks
+PROTOCOL = "3.5"  # the version of the link that the robot speaks
 LEAVE_SINCE = (3, 2)  # the first version whose cloud takes a leave (leave)
 UNNUMBERED = frozenset({"hello", "ping", "pong", "reconnect", "bye"})
 LARGEST_SEQ = 2**53 - 1  # $defs/seq: what JSON numbers hold exactly
@@ -33,6 +33,14 @@ UNANSWERABLE = "invalid_message"  # why a session ends over a frame that cannot 
 # (The session, hello; the cloud says the same, examples/first-message.json).
 NOT_FIRST = "the first message was not a hello"
 NOT_IN_TIME = "the hello did not come in time"
+# The cloud's closes that end the session, as a bye invalid_message would: no bye can follow,
+# and a resumed session would get the same frames again (Messages: Validation, Sizes and
+# Frames; RFC 6455, 7.4.1). Each says what the cloud found in what the robot sent.
+ENDING_CLOSES = {
+    WSCloseCode.INVALID_TEXT: "text that is not UTF-8",  # 1007, since 3.5
+    WSCloseCode.POLICY_VIOLATION: "frames past the link's rules",  # 1008, since 3.4
+    WSCloseCode.MESSAGE_TOO_BIG: "a message larger than it takes",  # 1009
+}
 _VERSION = re.compile(r"([0-9]{1,3})\.([0-9]{1,3})")  # $defs/version
 
 
@@ -43,8 +51,9 @@ class Ending:
     - ``greeted``: whether its hello exchange completed, which starts the backoff
       again;
     - ``reason``: why the session ended, from either side, if it did: a ``bye``'s reason,
-      or ``invalid_message`` for a frame that the connection closed over, after which no
-      bye can follow (Messages, Sizes). The session cannot resume after it;
+      or ``invalid_message`` for frames that the connection closed over, after which no
+      bye can follow (Messages: Validation, Sizes and Frames). The session cannot resume
+      after it;
     - ``by_cloud``: whether the cloud ended the session;
     - ``message``: what the robot's ``bye`` adds, for the cloud's logs.
     """
@@ -237,7 +246,7 @@ class Connection:
 
     async def _next(self) -> Message | Ending:
         """The cloud's next message, if the robot can read it; otherwise how the
-        connection ends (Messages, Validation and Sizes)."""
+        connection ends (Messages: Validation, Sizes and Frames)."""
         frame = await self.ws.receive()
         if frame.type is WSMsgType.TEXT:
             try:
@@ -260,12 +269,14 @@ class Connection:
         if frame.type is WSMsgType.ERROR and isinstance(frame.data, aiohttp.WebSocketError):
             # aiohttp could not read a frame, and closed the connection with the error's
             # code: 1009 for a message larger than the protocol allows, 1007 for text that
-            # is not UTF-8. No bye can follow, and the session ends (Messages, Sizes).
+            # is not UTF-8. No bye can follow, and the session ends (Messages: Validation
+            # and Sizes).
             code = frame.data.code
             log.warning("the cloud sent a frame that the robot cannot read (%d)", code)
             return Ending(greeted=True, reason=UNANSWERABLE)
-        if frame.type is WSMsgType.CLOSE and frame.data == WSCloseCode.MESSAGE_TOO_BIG:
-            log.warning("the robot sent the cloud a message larger than it takes")
+        if frame.type is WSMsgType.CLOSE and frame.data in ENDING_CLOSES:
+            sent = ENDING_CLOSES[frame.data]
+            log.warning("the cloud closed the connection (%d): the robot sent %s", frame.data, sent)
             return Ending(greeted=True, reason=UNANSWERABLE, by_cloud=True)
         return Ending(greeted=True)  # closed, or failed: the session may resume
 
