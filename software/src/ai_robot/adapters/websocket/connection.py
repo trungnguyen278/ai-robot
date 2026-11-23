@@ -23,7 +23,7 @@ from ai_robot.core.data import Schema, encode, read_json, write_json
 log = logging.getLogger(__name__)
 
 # Fixed by the protocol (platform/protocols/cloud/README.md, Messages and schema.json).
-PROTOCOL = "3.5"  # the version of the link that the robot speaks
+PROTOCOL = "3.6"  # the version of the link that the robot speaks
 LEAVE_SINCE = (3, 2)  # the first version whose cloud takes a leave (leave)
 UNNUMBERED = frozenset({"hello", "ping", "pong", "reconnect", "bye"})
 LARGEST_SEQ = 2**53 - 1  # $defs/seq: what JSON numbers hold exactly
@@ -37,6 +37,7 @@ NOT_IN_TIME = "the hello did not come in time"
 # and a resumed session would get the same frames again (Messages: Validation, Sizes and
 # Frames; RFC 6455, 7.4.1). Each says what the cloud found in what the robot sent.
 ENDING_CLOSES = {
+    WSCloseCode.PROTOCOL_ERROR: "a frame past WebSocket's own rules",  # 1002, since 3.6
     WSCloseCode.INVALID_TEXT: "text that is not UTF-8",  # 1007, since 3.5
     WSCloseCode.POLICY_VIOLATION: "frames past the link's rules",  # 1008, since 3.4
     WSCloseCode.MESSAGE_TOO_BIG: "a message larger than it takes",  # 1009
@@ -269,8 +270,8 @@ class Connection:
         if frame.type is WSMsgType.ERROR and isinstance(frame.data, aiohttp.WebSocketError):
             # aiohttp could not read a frame, and closed the connection with the error's
             # code: 1009 for a message larger than the protocol allows, 1007 for text that
-            # is not UTF-8. No bye can follow, and the session ends (Messages: Validation
-            # and Sizes).
+            # is not UTF-8, 1002 for a frame past WebSocket's own rules. No bye can follow,
+            # and the session ends (Messages: Validation, Sizes and Frames).
             code = frame.data.code
             log.warning("the cloud sent a frame that the robot cannot read (%d)", code)
             return Ending(greeted=True, reason=UNANSWERABLE)
