@@ -153,7 +153,7 @@ def test_the_robot_connects_with_a_token_and_says_what_it_is() -> None:
             (token,) = cloud.tokens
             assert cloud.bearers == [f"Bearer {token}"]
             assert cloud.assertions[0]["aud"] == cloud.endpoint
-            assert said["protocol"] == "3.5"
+            assert said["protocol"] == "3.6"
             assert said["device"]["kind"] == "robot" and said["device"]["model"] == "concept-v0"
             assert said["languages"] == ["vi", "en"] and said["time_zone"] == "Asia/Ho_Chi_Minh"
             assert said["allowed_classes"] == ["informational"]
@@ -930,6 +930,7 @@ def test_the_kinds_of_message_ignored_are_logged_once_and_at_most_max_warned(
 @pytest.mark.parametrize(
     ("code", "sent"),
     [
+        (1002, "a frame past WebSocket's own rules"),  # since 3.6
         (1007, "text that is not UTF-8"),  # since 3.5
         (1008, "frames past the link's rules"),  # since 3.4
         (1009, "a message larger than it takes"),
@@ -981,6 +982,50 @@ def test_text_that_is_not_utf_8_ends_the_session() -> None:
             assert "resume" not in await side.next("hello")
 
     run(main)
+
+
+# Frames that break WebSocket's own rules, from a server: unmasked (RFC 6455, 5.2).
+BROKEN_FRAMES = pytest.mark.parametrize(
+    "frames",
+    [
+        bytes([0x80, 0]),  # a continuation that continues nothing (5.4)
+        bytes([0x01, 1]) + b"{" + bytes([0x81, 2]) + b"{}",  # a message before the last's end
+        bytes([0x80 | 0x20 | 0x1, 2]) + b"{}",  # a reserved bit that nothing negotiated (5.2)
+        bytes([0x83, 0]),  # an opcode that RFC 6455 does not define (5.2)
+        bytes([0x09, 0]),  # a control frame in fragments (5.5)
+        bytes([0x89, 126]) + (126).to_bytes(2, "big") + b"x" * 126,  # one past 125 bytes (5.5)
+    ],
+    ids=[
+        "continuing nothing",
+        "interleaved",
+        "reserved bit",
+        "unknown opcode",
+        "fragmented ping",
+        "long ping",
+    ],
+)
+
+
+@BROKEN_FRAMES
+def test_a_frame_past_websocket_s_own_rules_ends_the_session(
+    frames: bytes, caplog: pytest.LogCaptureFixture
+) -> None:
+    """aiohttp closes with 1002 as it reads the frame, before the robot sees it, and no
+    bye can follow: the session ends, as after a 1007 (Messages: Validation, since 3.6)."""
+
+    async def main() -> None:
+        async with robot_and_cloud() as (link, cloud):
+            side, _ = await connect(link, cloud)
+            writer = side.ws._writer
+            assert writer is not None
+            writer.transport.write(frames)
+            await asyncio.wait_for(side.closed.wait(), TIMEOUT)
+            assert side.close_code == 1002  # aiohttp's, before any bye
+            side = await cloud.connection()
+            assert "resume" not in await side.next("hello")
+
+    run(main)
+    assert "the cloud sent a frame that the robot cannot read (1002)" in caplog.messages
 
 
 def test_what_the_cloud_cannot_hold_is_not_sent() -> None:
