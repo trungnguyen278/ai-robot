@@ -131,7 +131,7 @@ class CloudSide:
         self.sent = sent
         hello: dict[str, Any] = {
             "type": "hello",
-            "protocol": "3.3",
+            "protocol": "3.5",
             "session": session,
             "resumed": resumed,
             "time": "2026-10-28T03:20:00.310Z",

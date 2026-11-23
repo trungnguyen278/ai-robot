@@ -54,6 +54,7 @@ A failing check is a finding; fix it before reading further.
   - aiohttp 3.14.5 refuses a message of `max_msg_size` bytes and more, so the limit is set one past the protocol's.
   - A limit is tested as each peer may send: whole, and in fragments, which a library counts in its own way. websockets 17.3 refused some messages of exactly 1 MiB in fragments under compression (ai-cloud's dev log, 2026-11-21).
   - A body read from another side is bounded before it is read, the token endpoint's answer included.
+- A close that ends the session ends it whichever side closes. In the cloud link, 1007, 1008 and 1009 end it, as a `bye` `invalid_message` would: the robot's own close comes from aiohttp as an `ERROR` message, the cloud's as a `CLOSE` message whose data is its code. A rule written for one is checked for the other: the robot resumed its session after the cloud's 1007 and 1008 until it spoke 3.5.
 - Text from another side reaches a log only once a schema has passed it, or quoted with `%r`: a line break in it would start a forged log line. What the robot remembers per kind or per sender (`MAX_WARNED`) is bounded.
 - An error replies to the message it answers whenever that message's `seq` can be read, in a handshake too; only an unreadable message's error has no `reply_to`.
 - To whom a message goes: a link that serves several peers sends each answer to its own peer only. A characteristic's `Value` reaches every subscriber; check what the transport does, not only what the port says.

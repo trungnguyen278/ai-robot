@@ -153,7 +153,7 @@ def test_the_robot_connects_with_a_token_and_says_what_it_is() -> None:
             (token,) = cloud.tokens
             assert cloud.bearers == [f"Bearer {token}"]
             assert cloud.assertions[0]["aud"] == cloud.endpoint
-            assert said["protocol"] == "3.3"
+            assert said["protocol"] == "3.5"
             assert said["device"]["kind"] == "robot" and said["device"]["model"] == "concept-v0"
             assert said["languages"] == ["vi", "en"] and said["time_zone"] == "Asia/Ho_Chi_Minh"
             assert said["allowed_classes"] == ["informational"]
@@ -927,18 +927,40 @@ def test_the_kinds_of_message_ignored_are_logged_once_and_at_most_max_warned(
     ]
 
 
-def test_a_connection_the_cloud_closes_with_1009_ends_the_session(
-    caplog: pytest.LogCaptureFixture,
+@pytest.mark.parametrize(
+    ("code", "sent"),
+    [
+        (1007, "text that is not UTF-8"),  # since 3.5
+        (1008, "frames past the link's rules"),  # since 3.4
+        (1009, "a message larger than it takes"),
+    ],
+)
+def test_a_connection_the_cloud_closes_over_what_the_robot_sent_ends_the_session(
+    code: int, sent: str, caplog: pytest.LogCaptureFixture
 ) -> None:
+    """No bye can follow such a close, and a resumed session would get the same frames
+    again (Messages: Validation, Sizes and Frames)."""
+
     async def main() -> None:
         async with robot_and_cloud() as (link, cloud):
             side, _ = await connect(link, cloud)
-            await side.ws.close(code=1009)  # the robot's message was too large for it
+            await side.ws.close(code=code)
             side = await cloud.connection()
             assert "resume" not in await side.next("hello")
+            assert f"the cloud closed the connection ({code}): the robot sent {sent}" in (
+                caplog.messages
+            )
             assert "the cloud ended the session: invalid_message" in caplog.text  # not the robot
-            await side.hello()
-            await side.ws.close(code=1000)  # any other close: the session resumes
+
+    run(main)
+
+
+@pytest.mark.parametrize("code", [1000, 1001, 1011])
+def test_a_connection_the_cloud_closes_otherwise_resumes_the_session(code: int) -> None:
+    async def main() -> None:
+        async with robot_and_cloud() as (link, cloud):
+            side, _ = await connect(link, cloud)
+            await side.ws.close(code=code)
             side = await cloud.connection()
             assert (await side.next("hello"))["resume"]["session"] == SESSION
 

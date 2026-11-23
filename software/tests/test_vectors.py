@@ -6,6 +6,7 @@ schema check finds valid or invalid alike, each within its file's ``seconds``.""
 from __future__ import annotations
 
 import json
+import re
 import time
 from collections import defaultdict
 from functools import cache
@@ -103,3 +104,31 @@ def test_each_message_is_checked_as_every_side_checks_it(vector: dict[str, Any])
     problem = schema.problem(read_json(data))
     assert time.perf_counter() - started <= VALIDATING["seconds"]
     assert (problem is None) == (vector["result"] == "valid"), problem
+    if "keyword" in vector:
+        # The rule that the problem names is the only one the message breaks.
+        assert problem is not None and _keyword(problem) == vector["keyword"], problem
+
+
+def test_some_messages_name_the_keyword_they_break() -> None:
+    """Else a check of the keywords above would pass without a vector to run it."""
+    assert any("keyword" in vector for vector in VALIDATING["vectors"])
+
+
+def _keyword(problem: str) -> str | None:
+    """The schema's keyword whose rule ``problem`` names, as ``core/data.py``'s ``Schema``
+    words it: after where, if anywhere, ``'name' is a required property``, ``must be of
+    type ...`` or ``breaks <keyword> <its value>``; ``None`` for a schema that is false."""
+    rule = _RULE.fullmatch(problem)
+    assert rule is not None, problem
+    if rule["required"]:
+        return "required"
+    if rule["type"]:
+        return "type"
+    return rule["keyword"]
+
+
+_RULE = re.compile(
+    r"(?:.*?: )?(?:(?P<required>'.*' is a required property)|(?P<type>must be of type .+)"
+    r"|breaks (?P<keyword>[a-zA-Z]+) .+|is not allowed)",
+    re.DOTALL,
+)
