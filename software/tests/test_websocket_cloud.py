@@ -153,7 +153,7 @@ def test_the_robot_connects_with_a_token_and_says_what_it_is() -> None:
             (token,) = cloud.tokens
             assert cloud.bearers == [f"Bearer {token}"]
             assert cloud.assertions[0]["aud"] == cloud.endpoint
-            assert said["protocol"] == "3.6"
+            assert said["protocol"] == "3.7"
             assert said["device"]["kind"] == "robot" and said["device"]["model"] == "concept-v0"
             assert said["languages"] == ["vi", "en"] and said["time_zone"] == "Asia/Ho_Chi_Minh"
             assert said["allowed_classes"] == ["informational"]
@@ -557,6 +557,39 @@ def test_a_revoked_robot_is_not_set_up_any_more() -> None:
             assert link.session is None
 
     run(main)
+
+
+LONGEST = 0.4  # reconnect_max, in the tests that wait for it
+
+
+@pytest.mark.parametrize("ending", ["bye replaced", "taken over"])
+def test_a_session_that_another_connection_took_is_left_to_it(
+    ending: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A newer connection with the robot's credentials took the session: the cloud ends
+    the older's with bye replaced when the newer gets a new session, and closes the older
+    with 4000, "taken over", and no bye when the newer resumes it (since 3.7). Either way
+    the robot forgets the session and keeps away a while: resuming at once would take the
+    session back, and the two would take it from each other in turn (Resuming a session)."""
+    monkeypatch.setattr(link_module.random, "uniform", lambda low, high: high)
+
+    async def main() -> None:
+        async with robot_and_cloud(reconnect_first=0.001, reconnect_max=LONGEST) as (link, cloud):
+            side, _ = await connect(link, cloud)
+            loop = asyncio.get_running_loop()
+            if ending == "taken over":
+                await side.ws.close(code=4000)
+            else:
+                await side.send({"type": "bye", "reason": "replaced"})
+            ended = loop.time()
+            side = await cloud.connection()
+            assert loop.time() - ended >= LONGEST / 2  # not reconnect_first
+            assert "resume" not in await side.next("hello")
+
+    run(main)
+    assert "the cloud ended the session: replaced" in caplog.messages
+    taken = "the cloud closed the connection (4000): another connection took the session"
+    assert (taken in caplog.messages) == (ending == "taken over")
 
 
 def test_a_refused_token_brings_a_new_one() -> None:

@@ -23,12 +23,16 @@ from ai_robot.core.data import Schema, encode, read_json, write_json
 log = logging.getLogger(__name__)
 
 # Fixed by the protocol (platform/protocols/cloud/README.md, Messages and schema.json).
-PROTOCOL = "3.6"  # the version of the link that the robot speaks
+PROTOCOL = "3.7"  # the version of the link that the robot speaks
 LEAVE_SINCE = (3, 2)  # the first version whose cloud takes a leave (leave)
 UNNUMBERED = frozenset({"hello", "ping", "pong", "reconnect", "bye"})
 LARGEST_SEQ = 2**53 - 1  # $defs/seq: what JSON numbers hold exactly
 MAX_BYE = 256  # characters in a bye's message ($defs/short_text)
 UNANSWERABLE = "invalid_message"  # why a session ends over a frame that cannot be answered
+REPLACED = "replaced"  # why a session ends when another connection of the robot took it
+# The cloud's close for a connection whose session a newer connection resumed: the link's
+# first private code, "taken over", with no bye (Resuming a session, since 3.7).
+TAKEN_OVER = 4000
 # What the robot's bye no_hello adds, for the cloud's logs: which of its two causes it had
 # (The session, hello; the cloud says the same, examples/first-message.json).
 NOT_FIRST = "the first message was not a hello"
@@ -53,9 +57,11 @@ class Ending:
       again;
     - ``reason``: why the session ended, from either side, if it did: a ``bye``'s reason,
       or ``invalid_message`` for frames that the connection closed over, after which no
-      bye can follow (Messages: Validation, Sizes and Frames). The session cannot resume
-      after it;
-    - ``by_cloud``: whether the cloud ended the session;
+      bye can follow (Messages: Validation, Sizes and Frames), or ``replaced`` for a
+      session that another connection took over, which the cloud closes with 4000
+      (Resuming a session). The session cannot resume after it;
+    - ``by_cloud``: whether the cloud ended the session, or gave it to another
+      connection: the robot says no bye;
     - ``message``: what the robot's ``bye`` adds, for the cloud's logs.
     """
 
@@ -279,6 +285,15 @@ class Connection:
             sent = ENDING_CLOSES[frame.data]
             log.warning("the cloud closed the connection (%d): the robot sent %s", frame.data, sent)
             return Ending(greeted=True, reason=UNANSWERABLE, by_cloud=True)
+        if frame.type is WSMsgType.CLOSE and frame.data == TAKEN_OVER:
+            # The robot closes its connection before it connects again, so another copy
+            # of its software, with its credentials, resumed the session: the robot does
+            # as after a bye replaced, since taking it back would start a tug of war.
+            log.warning(
+                "the cloud closed the connection (%d): another connection took the session",
+                TAKEN_OVER,
+            )
+            return Ending(greeted=True, reason=REPLACED, by_cloud=True)
         return Ending(greeted=True)  # closed, or failed: the session may resume
 
     def _failing(self, message: Message) -> Ending | None:

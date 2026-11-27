@@ -32,6 +32,7 @@ from ai_robot.adapters.websocket.connection import (
     LEAVE_SINCE,
     NOT_IN_TIME,
     PROTOCOL,
+    REPLACED,
     Connection,
     Ending,
     version,
@@ -64,6 +65,9 @@ log = logging.getLogger(__name__)
 # Fixed by the protocol (platform/protocols/cloud/README.md, Connecting and The session).
 LINK_PATH = "/device/v3/link"
 MEDIA = "livekit"  # where conversations' audio goes
+# The terms of a session, which the hello that opens it sets and a resuming hello repeats:
+# one that changed them would get a new session (hello, since 3.7).
+TERMS = ("protocol", "device", "conversations", "media")
 
 
 class Refused(Exception):
@@ -444,7 +448,8 @@ class WebSocketCloud(Cloud):
         resuming, said = self.session, self.device
         declared = {kind.name for kind in self.event_kinds}
         offered = self.audio is not None
-        await connection.say(self._hello(said, resuming))
+        hello = self._hello(said, resuming)
+        await connection.say(hello)
         try:
             async with asyncio.timeout(self.hello_timeout):
                 answer = await connection.first()
@@ -471,6 +476,7 @@ class WebSocketCloud(Cloud):
         else:
             await self._forget()
             session = Session(self, answer["session"], next(self._numbers), self.schema)
+            session.terms = {name: hello[name] for name in TERMS}
             session.protocol = version(answer["protocol"])
             self.session = session
             log.info("cloud session %s open (protocol %s)", session.id, answer["protocol"])
@@ -513,6 +519,7 @@ class WebSocketCloud(Cloud):
             ],
         }
         if resuming is not None:
+            hello.update(resuming.terms)  # what the robot offers since waits for a new session
             hello["resume"] = {"session": resuming.id, "received": resuming.received}
         conversation = self.conversations.named()
         if conversation is not None:
@@ -531,7 +538,7 @@ class WebSocketCloud(Cloud):
             self._known(False)
         elif ending.reason == "update_required":
             self._needs_update("the cloud asks for it")
-        elif ending.reason == "replaced":
+        elif ending.reason == REPLACED:
             return self._backoff(0, self.reconnect_max)  # keep to the newer connection
         return 0.0
 

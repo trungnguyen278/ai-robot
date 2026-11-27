@@ -82,6 +82,7 @@ class Session:
         self.events: frozenset[str] = frozenset()  # the events the cloud subscribed to
         self.conversations = False  # whether both sides hold conversations
         self.protocol = (0, 0)  # the version of the link the cloud speaks, from its hello
+        self.terms: dict[str, Any] = {}  # what the robot's hello that opened it set
         self.leave: int | None = None  # the number of the robot's leave, while one is asked
         self.sent = 0  # the number of the last message the robot sent
         self.received = 0  # the number of the last message received from the cloud
