@@ -14,7 +14,7 @@ import waiting
 from fake_cloud import TIMEOUT, CloudSide, FakeCloud
 from test_websocket_cloud import DEVICE, LAMP, SESSION, reconnection, robot_and_cloud
 
-from ai_robot.adapters.websocket.cloud import WebSocketCloud
+from ai_robot.adapters.websocket.cloud import TERMS, WebSocketCloud
 from ai_robot.ports import (
     AudioFormat,
     CloudPart,
@@ -122,6 +122,35 @@ def test_a_robot_that_holds_conversations_says_so() -> None:
             _, said = await talking(link, cloud)
             assert (said["conversations"], said["media"]) == (True, ["livekit"])
             assert link.session is not None and link.session.conversations
+
+    run(main)
+
+
+def test_a_resuming_hello_repeats_the_terms_that_opened_the_session() -> None:
+    """A resume keeps the terms that the session's first hello set, and one that changed
+    them would get a new session (hello, since 3.7): conversations offered since wait for
+    the robot's next session."""
+
+    async def main() -> None:
+        async with robot_and_cloud() as (link, cloud):
+            await link.describe(DEVICE)
+            await link.offer([LAMP], [])
+            side = await cloud.connection()
+            first = await side.next("hello")
+            await side.hello()
+            await waiting.until(lambda: link.connection is not None, TIMEOUT)
+            await link.offer([LAMP], [], conversation=AUDIO)
+            side, again = await reconnection(cloud, side)
+            assert again["resume"] == {"session": SESSION, "received": 0}
+            assert {name: again[name] for name in TERMS} == {name: first[name] for name in TERMS}
+            assert (again["conversations"], again["media"]) == (False, [])
+            await side.hello(resumed=True, received=0)
+            await waiting.until(lambda: link.connection is not None, TIMEOUT)
+            await side.send({"type": "bye", "reason": "replaced"})  # the session ends
+            side = await cloud.connection()
+            new = await side.next("hello")
+            assert "resume" not in new
+            assert (new["conversations"], new["media"]) == (True, ["livekit"])
 
     run(main)
 
